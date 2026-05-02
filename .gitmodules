@@ -1,0 +1,3 @@
+[submodule "upstream-xcodegen"]
+	path = upstream-xcodegen
+	url = https://github.com/yonaskolb/xcodegen.git
