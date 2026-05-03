@@ -25,11 +25,20 @@ Implemented:
 
 See `TEST_PARITY.md` for the current upstream test parity map.
 
+## Install With Homebrew
+
+```sh
+brew tap min/xcodegen-rs https://github.com/min/xcodegen-rs
+brew install xcodegen-rs
+```
+
+This installs the `xgr` CLI.
+
 ## Install From Source
 
 ```sh
-git clone --recurse-submodules https://github.com/min/XcodeGenRust.git
-cd XcodeGenRust
+git clone --recurse-submodules https://github.com/min/xcodegen-rs.git
+cd xcodegen-rs
 cargo build --release --locked
 ```
 
