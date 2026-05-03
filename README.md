@@ -28,7 +28,7 @@ See `TEST_PARITY.md` for the current upstream test parity map.
 ## Install From Source
 
 ```sh
-git clone --recurse-submodules https://github.com/min/xcodegen-rust.git
+git clone --recurse-submodules https://github.com/min/xcodegen-rs.git
 cd XcodeGenRust
 cargo build --release --locked
 ```
