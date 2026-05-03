@@ -1,0 +1,52 @@
+name: Compatibility Gap
+description: Report output or behavior that differs from upstream XcodeGen.
+title: "Compatibility: "
+labels:
+  - compatibility
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this when `xgr` accepts a spec but differs from upstream XcodeGen behavior.
+  - type: textarea
+    id: spec
+    attributes:
+      label: Minimal Spec
+      description: Paste a minimal `project.yml` or link to a small public reproduction.
+      render: yaml
+    validations:
+      required: true
+  - type: input
+    id: upstream
+    attributes:
+      label: Upstream XcodeGen Version
+      description: Version or commit used as the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands Compared
+      description: Paste the upstream XcodeGen command and the `xgr` command.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: difference
+    attributes:
+      label: Difference
+      description: Describe the generated file or behavior that differs. Include a small diff if possible.
+      render: diff
+    validations:
+      required: true
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      options:
+        - Xcode project does not open or build
+        - Xcode behavior differs
+        - Generated text differs only
+        - Unsure
+    validations:
+      required: true

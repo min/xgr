@@ -8,7 +8,15 @@
 
 The goal is practical parity with [`yonaskolb/XcodeGen`](https://github.com/yonaskolb/XcodeGen): load the same project specs, generate deterministic Xcode project files, and keep behavior covered by upstream fixture tests.
 
+Naming:
+
+- Project: `XcodeGenRust`
+- Crate: `xcodegenrust`
+- CLI: `xgr`
+
 ## Status
+
+`XcodeGenRust` is pre-1.0 software. It is intended for compatibility testing, automation experiments, and projects that can compare generated output before adopting it. It should not be treated as a drop-in replacement for upstream XcodeGen without checking the generated `.xcodeproj` in your repository.
 
 Implemented:
 
@@ -21,9 +29,19 @@ Implemented:
 - Deterministic PBX project generation.
 - Scheme, breakpoint, generated plist, and entitlement file writing.
 - Upstream XcodeGen fixture coverage and test-inventory tracking.
-- GitHub Actions CI for tests, clippy, and dependency audit.
+- GitHub Actions CI for formatting, clippy, tests, and dependency audit.
 
 See `TEST_PARITY.md` for the current upstream test parity map.
+
+## Compatibility
+
+The compatibility target is upstream XcodeGen behavior for `project.yml` specs. Current coverage includes the upstream Swift test inventory in this checkout, plus byte-for-byte `project.pbxproj` parity for the checked fixture goldens listed in `TEST_PARITY.md`.
+
+Known limitations:
+
+- XcodeGen `preGenCommand` and `postGenCommand` hooks are not executed.
+- Compatibility is measured against the vendored `upstream-xcodegen` checkout. Updating that checkout requires rerunning the inventory workflow documented in `TEST_PARITY.md`.
+- The project is not yet released as a supported replacement for every real-world XcodeGen configuration. If output differs from upstream XcodeGen, please file a compatibility issue with the spec and a description of the expected output.
 
 ## Install With Homebrew
 
@@ -47,6 +65,14 @@ If the repo was cloned without submodules:
 ```sh
 git submodule update --init --recursive
 ```
+
+Install the CLI locally from a checkout:
+
+```sh
+cargo install --path . --locked
+```
+
+Published crates.io packages and binary release artifacts are not available yet. Until then, source builds are the supported installation path.
 
 ## Usage
 
@@ -76,6 +102,14 @@ cargo run --bin xgr -- generate \
   --output path/to/Project.xcodeproj
 ```
 
+After installing with `cargo install`, replace `cargo run --bin xgr --` with `xgr`:
+
+```sh
+xgr generate --spec path/to/project.yml --output path/to/Project.xcodeproj
+```
+
+When evaluating a real project, generate into a temporary path first and compare the generated project against upstream XcodeGen before replacing checked-in files.
+
 ## Development
 
 ```sh
@@ -86,6 +120,10 @@ cargo audit --deny warnings
 ```
 
 Local benchmark artifacts should stay under `.context/bench`, which is ignored by git.
+
+See `CONTRIBUTING.md` for the full contribution workflow, upstream fixture maintenance process, and issue-reporting expectations.
+
+See `CHANGELOG.md` for release history and unreleased public-prep changes.
 
 ## Security Model
 

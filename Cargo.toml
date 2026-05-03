@@ -6,6 +6,9 @@ license = "MIT"
 description = "Rust port of XcodeGen's project.yml spec loader and project generator"
 repository = "https://github.com/min/xcodegen-rs"
 readme = "README.md"
+keywords = ["xcode", "xcodegen", "ios", "macos", "project-generator"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/", ".context/", "upstream-xcodegen/"]
 
 [lib]
 name = "xcodegenrust"
