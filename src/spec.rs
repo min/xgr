@@ -597,6 +597,7 @@ pub struct SpecOptions {
     pub setting_presets_none: bool,
     pub transitively_link_dependencies: bool,
     pub group_sort_position: GroupSortPosition,
+    pub group_sort_position_explicit: bool,
     pub group_ordering: Vec<GroupOrdering>,
     pub uses_tabs: Option<bool>,
     pub indent_width: Option<i64>,
@@ -625,6 +626,7 @@ impl Default for SpecOptions {
             setting_presets_none: false,
             transitively_link_dependencies: false,
             group_sort_position: GroupSortPosition::Top,
+            group_sort_position_explicit: false,
             group_ordering: Vec::new(),
             uses_tabs: None,
             indent_width: None,
@@ -663,6 +665,7 @@ impl SpecOptions {
             transitively_link_dependencies: boolish(map.get("transitivelyLinkDependencies"))
                 .unwrap_or(false),
             group_sort_position: GroupSortPosition::from_value(map.get("groupSortPosition")),
+            group_sort_position_explicit: map.contains_key("groupSortPosition"),
             group_ordering: parse_group_ordering(map.get("groupOrdering")),
             uses_tabs: boolish(map.get("usesTabs")),
             indent_width: map.get("indentWidth").and_then(Value::as_i64),
@@ -860,6 +863,7 @@ impl Plist {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TargetScheme {
     pub test_targets: Vec<String>,
+    pub test_target_options: Vec<SchemeTestTarget>,
     pub test_plans: Vec<TestPlan>,
     pub config_variants: Vec<String>,
     pub gather_coverage_data: bool,
@@ -884,6 +888,7 @@ impl TargetScheme {
         };
         Some(Self {
             test_targets: parse_target_names(map.get("testTargets")),
+            test_target_options: parse_test_targets(map.get("testTargets")),
             test_plans: parse_test_plans(map.get("testPlans")),
             config_variants: parse_string_array(map.get("configVariants")),
             gather_coverage_data: boolish(map.get("gatherCoverageData")).unwrap_or(false),
@@ -1081,6 +1086,9 @@ pub struct SchemeTest {
     pub targets: Vec<SchemeTestTarget>,
     pub coverage_targets: Vec<String>,
     pub test_plans: Vec<TestPlan>,
+    pub pre_actions: Vec<SchemeAction>,
+    pub post_actions: Vec<SchemeAction>,
+    pub command_line_arguments: IndexMap<String, bool>,
     pub environment_variables: Vec<EnvironmentVariable>,
     pub capture_screenshots_automatically: Option<bool>,
     pub delete_screenshots_when_each_test_succeeds: Option<bool>,
@@ -1105,6 +1113,9 @@ impl SchemeTest {
             targets: parse_test_targets(map.get("targets")),
             coverage_targets: parse_string_array(map.get("coverageTargets")),
             test_plans: parse_test_plans(map.get("testPlans")),
+            pre_actions: parse_scheme_actions(map.get("preActions")),
+            post_actions: parse_scheme_actions(map.get("postActions")),
+            command_line_arguments: parse_bool_map(map.get("commandLineArguments")),
             environment_variables: parse_environment_variables(map.get("environmentVariables")),
             capture_screenshots_automatically: boolish(map.get("captureScreenshotsAutomatically")),
             delete_screenshots_when_each_test_succeeds: boolish(

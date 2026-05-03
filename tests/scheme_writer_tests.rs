@@ -6,6 +6,22 @@ fn project_from_json(base_path: std::path::PathBuf, value: Value) -> Project {
     Project::from_dictionary(base_path, value.as_object().unwrap().clone()).unwrap()
 }
 
+fn compact_xml(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" = ", "=")
+}
+
+fn xml_contains(haystack: &str, needle: &str) -> bool {
+    compact_xml(haystack).contains(&compact_xml(needle))
+}
+
+fn xml_match_count(haystack: &str, needle: &str) -> usize {
+    compact_xml(haystack).matches(&compact_xml(needle)).count()
+}
+
 #[test]
 fn writer_generates_shared_scheme_like_xcodegen() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -80,36 +96,70 @@ fn writer_generates_shared_scheme_like_xcodegen() {
             .join("xcshareddata/xcschemes/MyScheme.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("parallelizeBuildables=\"NO\""));
-    assert!(scheme.contains("buildImplicitDependencies=\"NO\""));
-    assert!(scheme.contains("BuildableName=\"App.app\""));
-    assert!(scheme.contains("BlueprintName=\"App\""));
-    assert!(scheme.contains("title=\"Script\""));
-    assert!(scheme.contains("scriptText=\"echo Starting\""));
-    assert!(scheme.contains("selectedDebuggerIdentifier=\"\""));
-    assert!(
-        scheme.contains("selectedLauncherIdentifier=\"Xcode.IDEFoundation.Launcher.PosixSpawn\"")
-    );
-    assert!(scheme.contains("launchAutomaticallySubstyle=\"2\""));
-    assert!(scheme.contains("askForAppToLaunch=\"YES\""));
-    assert!(scheme.contains("customLLDBInitFile=\"/sample/.lldbinit\""));
-    assert!(scheme.contains("useCustomWorkingDirectory=\"YES\""));
-    assert!(scheme.contains("customWorkingDirectory=\"/test\""));
-    assert!(scheme.contains("enableGPUFrameCaptureMode=\"metal\""));
-    assert!(scheme.contains("language=\"en\""));
-    assert!(scheme.contains("region=\"US\""));
-    assert!(scheme.contains("argument=\"-UITestMode\" isEnabled=\"YES\""));
-    assert!(scheme.contains("argument=\"-SkipIntro\" isEnabled=\"NO\""));
-    assert!(scheme.contains("customLLDBInitFile=\"/test/.lldbinit\""));
-    assert!(scheme.contains("identifier=\"../Configuration.storekit\""));
-    assert!(scheme.contains("identifier=\"../test.gpx\" referenceType=\"0\""));
-    assert!(scheme.contains("identifier=\"New York, NY, USA\" referenceType=\"1\""));
-    assert!(scheme.contains("key=\"RUN_ENV\" value=\"ENABLED\" isEnabled=\"YES\""));
-    assert!(scheme.contains("key=\"TEST_ENV\" value=\"1\" isEnabled=\"NO\""));
-    assert!(scheme.contains("codeCoverageEnabled=\"YES\""));
-    assert!(scheme.contains("reference=\"container:App.xctestplan\" default=\"YES\""));
-    assert!(scheme.contains("ProfileAction buildConfiguration=\"Release\""));
-    assert!(scheme.contains("askForAppToLaunch=\"YES\""));
+    assert!(xml_contains(&scheme, "parallelizeBuildables=\"NO\""));
+    assert!(xml_contains(&scheme, "buildImplicitDependencies=\"NO\""));
+    assert!(xml_contains(&scheme, "BuildableName=\"App.app\""));
+    assert!(xml_contains(&scheme, "BlueprintName=\"App\""));
+    assert!(xml_contains(&scheme, "title=\"Script\""));
+    assert!(xml_contains(&scheme, "scriptText=\"echo Starting\""));
+    assert!(xml_contains(&scheme, "selectedDebuggerIdentifier=\"\""));
+    assert!(xml_contains(
+        &scheme,
+        "selectedLauncherIdentifier=\"Xcode.IDEFoundation.Launcher.PosixSpawn\""
+    ));
+    assert!(xml_contains(&scheme, "launchAutomaticallySubstyle=\"2\""));
+    assert!(xml_contains(&scheme, "askForAppToLaunch=\"YES\""));
+    assert!(xml_contains(
+        &scheme,
+        "customLLDBInitFile=\"/sample/.lldbinit\""
+    ));
+    assert!(xml_contains(&scheme, "useCustomWorkingDirectory=\"YES\""));
+    assert!(xml_contains(&scheme, "customWorkingDirectory=\"/test\""));
+    assert!(xml_contains(&scheme, "enableGPUFrameCaptureMode=\"metal\""));
+    assert!(xml_contains(&scheme, "language=\"en\""));
+    assert!(xml_contains(&scheme, "region=\"US\""));
+    assert!(xml_contains(
+        &scheme,
+        "argument=\"-UITestMode\" isEnabled=\"YES\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "argument=\"-SkipIntro\" isEnabled=\"NO\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "customLLDBInitFile=\"/test/.lldbinit\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "identifier=\"../Configuration.storekit\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "identifier=\"../test.gpx\" referenceType=\"0\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "identifier=\"New York, NY, USA\" referenceType=\"1\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "key=\"RUN_ENV\" value=\"ENABLED\" isEnabled=\"YES\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "key=\"TEST_ENV\" value=\"1\" isEnabled=\"NO\""
+    ));
+    assert!(xml_contains(&scheme, "codeCoverageEnabled=\"YES\""));
+    assert!(xml_contains(
+        &scheme,
+        "reference=\"container:App.xctestplan\" default=\"YES\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "ProfileAction buildConfiguration=\"Release\""
+    ));
+    assert!(xml_contains(&scheme, "askForAppToLaunch=\"YES\""));
 }
 
 #[test]
@@ -164,17 +214,38 @@ fn writer_generates_target_scheme_config_variants_like_xcodegen() {
     )
     .unwrap();
 
-    assert!(staging.contains("buildConfiguration=\"Staging-Debug\""));
-    assert!(staging.contains("buildConfiguration=\"Staging Release\""));
-    assert!(production.contains("buildConfiguration=\"Production-Debug\""));
-    assert!(production.contains("buildConfiguration=\"Production Release\""));
-    assert!(staging.contains("BuildableName=\"Tests.xctest\""));
-    assert!(staging.contains("codeCoverageEnabled=\"YES\""));
-    assert!(staging.contains("identifier=\"Configuration.storekit\""));
-    assert!(staging.contains("language=\"fr\""));
-    assert!(staging.contains("region=\"CA\""));
-    assert!(staging.contains("argument=\"-TargetScheme\" isEnabled=\"YES\""));
-    assert!(staging.contains("key=\"ENV\" value=\"VALUE\" isEnabled=\"YES\""));
+    assert!(xml_contains(
+        &staging,
+        "buildConfiguration=\"Staging-Debug\""
+    ));
+    assert!(xml_contains(
+        &staging,
+        "buildConfiguration=\"Staging Release\""
+    ));
+    assert!(xml_contains(
+        &production,
+        "buildConfiguration=\"Production-Debug\""
+    ));
+    assert!(xml_contains(
+        &production,
+        "buildConfiguration=\"Production Release\""
+    ));
+    assert!(xml_contains(&staging, "BuildableName=\"Tests.xctest\""));
+    assert!(xml_contains(&staging, "codeCoverageEnabled=\"YES\""));
+    assert!(xml_contains(
+        &staging,
+        "identifier=\"Configuration.storekit\""
+    ));
+    assert!(xml_contains(&staging, "language=\"fr\""));
+    assert!(xml_contains(&staging, "region=\"CA\""));
+    assert!(xml_contains(
+        &staging,
+        "argument=\"-TargetScheme\" isEnabled=\"YES\""
+    ));
+    assert!(xml_contains(
+        &staging,
+        "key=\"ENV\" value=\"VALUE\" isEnabled=\"YES\""
+    ));
 }
 
 #[test]
@@ -222,9 +293,12 @@ fn writer_generates_macro_expansion_for_run_and_test_like_xcodegen() {
             .join("xcshareddata/xcschemes/TestScheme.xcscheme"),
     )
     .unwrap();
-    assert_eq!(scheme.matches("<MacroExpansion>").count(), 2);
-    assert!(scheme.contains("BuildableName=\"MyApp.app\""));
-    assert!(scheme.contains("BuildableName=\"MyAppExtension.appex\""));
+    assert_eq!(xml_match_count(&scheme, "<MacroExpansion>"), 2);
+    assert!(xml_contains(&scheme, "BuildableName=\"MyApp.app\""));
+    assert!(xml_contains(
+        &scheme,
+        "BuildableName=\"MyAppExtension.appex\""
+    ));
 }
 
 #[test]
@@ -264,9 +338,9 @@ fn writer_uses_testing_runnable_for_test_macro_expansion_like_xcodegen() {
             .join("xcshareddata/xcschemes/TestScheme.xcscheme"),
     )
     .unwrap();
-    assert_eq!(scheme.matches("<MacroExpansion>").count(), 2);
-    assert!(scheme.contains("BuildableName=\"MyApp.app\""));
-    assert!(scheme.contains("BuildableName=\"MockApp.app\""));
+    assert_eq!(xml_match_count(&scheme, "<MacroExpansion>"), 2);
+    assert!(xml_contains(&scheme, "BuildableName=\"MyApp.app\""));
+    assert!(xml_contains(&scheme, "BuildableName=\"MockApp.app\""));
 }
 
 #[test]
@@ -299,10 +373,16 @@ fn writer_generates_test_target_references_for_local_swift_packages_like_xcodege
             .join("xcshareddata/xcschemes/MyApp.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("BlueprintIdentifier=\"XcodeGenKitTests\""));
-    assert!(scheme.contains("BuildableName=\"XcodeGenKitTests\""));
-    assert!(scheme.contains("BlueprintName=\"XcodeGenKitTests\""));
-    assert!(scheme.contains("ReferencedContainer=\"container:../\""));
+    assert!(xml_contains(
+        &scheme,
+        "BlueprintIdentifier=\"XcodeGenKitTests\""
+    ));
+    assert!(xml_contains(&scheme, "BuildableName=\"XcodeGenKitTests\""));
+    assert!(xml_contains(&scheme, "BlueprintName=\"XcodeGenKitTests\""));
+    assert!(xml_contains(
+        &scheme,
+        "ReferencedContainer=\"container:../\""
+    ));
 }
 
 #[test]
@@ -332,12 +412,21 @@ fn writer_generates_breakpoints_like_xcodegen() {
             .join("xcshareddata/xcdebugger/Breakpoints_v2.xcbkptlist"),
     )
     .unwrap();
-    assert!(breakpoints.contains("Xcode.Breakpoint.ExceptionBreakpoint"));
-    assert!(breakpoints.contains("Xcode.Breakpoint.FileBreakpoint"));
-    assert!(breakpoints.contains("filePath=\"Sources/App.swift\""));
-    assert!(breakpoints.contains("startingLineNumber=\"7\""));
-    assert!(breakpoints.contains("startingColumnNumber=\"13\""));
-    assert!(breakpoints.contains("condition=\"launchOptions == nil\""));
+    assert!(xml_contains(
+        &breakpoints,
+        "Xcode.Breakpoint.ExceptionBreakpoint"
+    ));
+    assert!(xml_contains(
+        &breakpoints,
+        "Xcode.Breakpoint.FileBreakpoint"
+    ));
+    assert!(xml_contains(&breakpoints, "filePath=\"Sources/App.swift\""));
+    assert!(xml_contains(&breakpoints, "startingLineNumber=\"7\""));
+    assert!(xml_contains(&breakpoints, "startingColumnNumber=\"13\""));
+    assert!(xml_contains(
+        &breakpoints,
+        "condition=\"launchOptions == nil\""
+    ));
 }
 
 #[test]
@@ -376,8 +465,11 @@ fn writer_selects_first_runnable_scheme_target_like_xcodegen() {
         .nth(1)
         .and_then(|value| value.split("</LaunchAction>").next())
         .unwrap();
-    assert!(launch_action.contains("BuildableName=\"App.app\""));
-    assert!(!launch_action.contains("BuildableName=\"Framework.framework\""));
+    assert!(xml_contains(launch_action, "BuildableName=\"App.app\""));
+    assert!(!xml_contains(
+        launch_action,
+        "BuildableName=\"Framework.framework\""
+    ));
 }
 
 #[test]
@@ -422,14 +514,17 @@ fn writer_generates_external_project_build_and_coverage_references_like_xcodegen
             .join("xcshareddata/xcschemes/ExternalProjectScheme.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("BlueprintName=\"ExternalTarget\""));
-    assert!(scheme.contains("ReferencedContainer=\"container:ExternalProject.xcodeproj\""));
-    assert!(scheme.contains("<CodeCoverageTargets>"));
+    assert!(xml_contains(&scheme, "BlueprintName=\"ExternalTarget\""));
+    assert!(xml_contains(
+        &scheme,
+        "ReferencedContainer=\"container:ExternalProject.xcodeproj\""
+    ));
+    assert!(xml_contains(&scheme, "<CodeCoverageTargets>"));
     assert_eq!(
-        scheme.matches("BlueprintName=\"ExternalTarget\"").count(),
+        xml_match_count(&scheme, "BlueprintName=\"ExternalTarget\""),
         2
     );
-    assert!(scheme.contains("BlueprintName=\"Framework\""));
+    assert!(xml_contains(&scheme, "BlueprintName=\"Framework\""));
 }
 
 #[test]
@@ -467,10 +562,16 @@ fn writer_generates_watch_target_scheme_remote_runnable_and_host_build_like_xcod
             .join("xcshareddata/xcschemes/WatchApp.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("<RemoteRunnable runnableDebuggingMode=\"2\">"));
-    assert!(scheme.contains("BuildableName=\"WatchApp.app\""));
-    assert!(scheme.contains("BuildableName=\"HostApp.app\""));
-    assert!(scheme.contains("identifier=\"../Configuration.storekit\""));
+    assert!(xml_contains(
+        &scheme,
+        "<RemoteRunnable runnableDebuggingMode=\"2\">"
+    ));
+    assert!(xml_contains(&scheme, "BuildableName=\"WatchApp.app\""));
+    assert!(xml_contains(&scheme, "BuildableName=\"HostApp.app\""));
+    assert!(xml_contains(
+        &scheme,
+        "identifier=\"../Configuration.storekit\""
+    ));
 }
 
 #[test]
@@ -504,13 +605,13 @@ fn writer_generates_pre_and_post_actions_for_target_schemes_like_xcodegen() {
             .join("xcshareddata/xcschemes/App.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("<PreActions>"));
-    assert!(scheme.contains("title=\"Run\""));
-    assert!(scheme.contains("scriptText=\"do\""));
-    assert!(scheme.contains("<PostActions>"));
-    assert!(scheme.contains("title=\"Cleanup\""));
-    assert!(scheme.contains("scriptText=\"done\""));
-    assert!(scheme.contains("BuildableName=\"App.app\""));
+    assert!(xml_contains(&scheme, "<PreActions>"));
+    assert!(xml_contains(&scheme, "title=\"Run\""));
+    assert!(xml_contains(&scheme, "scriptText=\"do\""));
+    assert!(xml_contains(&scheme, "<PostActions>"));
+    assert!(xml_contains(&scheme, "title=\"Cleanup\""));
+    assert!(xml_contains(&scheme, "scriptText=\"done\""));
+    assert!(xml_contains(&scheme, "BuildableName=\"App.app\""));
 }
 
 #[test]
@@ -539,10 +640,10 @@ fn writer_generates_scheme_management_for_hidden_target_scheme_like_xcodegen() {
             .join("xcuserdata/xcodegenrust.xcuserdatad/xcschemes/xcschememanagement.plist"),
     )
     .unwrap();
-    assert!(management.contains("MyApp.xcscheme_^#shared#^_"));
-    assert!(management.contains("<key>isShown</key>"));
-    assert!(management.contains("<false />"));
-    assert!(!management.contains("<key>orderHint</key>"));
+    assert!(xml_contains(&management, "MyApp.xcscheme_^#shared#^_"));
+    assert!(xml_contains(&management, "<key>isShown</key>"));
+    assert!(xml_contains(&management, "<false />"));
+    assert!(!xml_contains(&management, "<key>orderHint</key>"));
 }
 
 #[test]
@@ -581,9 +682,11 @@ fn writer_generates_scheme_without_debugger_for_test_like_xcodegen() {
         .nth(1)
         .and_then(|value| value.split("</TestAction>").next())
         .unwrap();
-    assert!(test_action.contains("selectedDebuggerIdentifier=\"\""));
-    assert!(test_action
-        .contains("selectedLauncherIdentifier=\"Xcode.IDEFoundation.Launcher.PosixSpawn\""));
+    assert!(xml_contains(test_action, "selectedDebuggerIdentifier=\"\""));
+    assert!(xml_contains(
+        test_action,
+        "selectedLauncherIdentifier=\"Xcode.IDEFoundation.Launcher.PosixSpawn\""
+    ));
 }
 
 #[test]
@@ -624,11 +727,23 @@ fn writer_generates_checker_toggles_like_xcodegen() {
             .join("xcshareddata/xcschemes/CheckerScheme.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("LaunchAction buildConfiguration=\"Debug\""));
-    assert!(scheme.contains("disableMainThreadChecker=\"YES\""));
-    assert!(scheme.contains("stopOnEveryMainThreadCheckerIssue=\"YES\""));
-    assert!(scheme.contains("disableThreadPerformanceChecker=\"YES\""));
-    assert!(scheme.contains("TestAction buildConfiguration=\"Debug\""));
+    assert!(xml_contains(
+        &scheme,
+        "LaunchAction buildConfiguration=\"Debug\""
+    ));
+    assert!(xml_contains(&scheme, "disableMainThreadChecker=\"YES\""));
+    assert!(xml_contains(
+        &scheme,
+        "stopOnEveryMainThreadCheckerIssue=\"YES\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "disableThreadPerformanceChecker=\"YES\""
+    ));
+    assert!(xml_contains(
+        &scheme,
+        "TestAction buildConfiguration=\"Debug\""
+    ));
 }
 
 #[test]
@@ -688,9 +803,18 @@ fn writer_generates_screenshot_capture_preferences_like_xcodegen() {
     )
     .unwrap();
 
-    assert!(!delete_on_success.contains("systemAttachmentLifetime="));
-    assert!(keep_always.contains("systemAttachmentLifetime=\"keepAlways\""));
-    assert!(keep_never.contains("systemAttachmentLifetime=\"keepNever\""));
+    assert!(!xml_contains(
+        &delete_on_success,
+        "systemAttachmentLifetime="
+    ));
+    assert!(xml_contains(
+        &keep_always,
+        "systemAttachmentLifetime=\"keepAlways\""
+    ));
+    assert!(xml_contains(
+        &keep_never,
+        "systemAttachmentLifetime=\"keepNever\""
+    ));
 }
 
 #[test]
@@ -727,8 +851,14 @@ fn writer_generates_preferred_screen_capture_format_like_xcodegen() {
             .join("xcshareddata/xcschemes/Recording.xcscheme"),
     )
     .unwrap();
-    assert!(screenshots.contains("preferredScreenCaptureFormat=\"screenshots\""));
-    assert!(recording.contains("preferredScreenCaptureFormat=\"screenRecording\""));
+    assert!(xml_contains(
+        &screenshots,
+        "preferredScreenCaptureFormat=\"screenshots\""
+    ));
+    assert!(xml_contains(
+        &recording,
+        "preferredScreenCaptureFormat=\"screenRecording\""
+    ));
 }
 
 #[test]
@@ -756,7 +886,7 @@ fn writer_uses_last_upgrade_check_for_scheme_last_upgrade_version_like_xcodegen(
             .join("xcshareddata/xcschemes/App.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("LastUpgradeVersion=\"1234\""));
+    assert!(xml_contains(&scheme, "LastUpgradeVersion=\"1234\""));
 }
 
 #[test]
@@ -783,7 +913,7 @@ fn writer_defaults_scheme_last_upgrade_version_like_xcodegen() {
             .join("xcshareddata/xcschemes/App.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("LastUpgradeVersion=\"1600\""));
+    assert!(xml_contains(&scheme, "LastUpgradeVersion=\"1430\""));
 }
 
 #[test]
@@ -816,9 +946,9 @@ fn writer_generates_predefined_location_simulation_like_xcodegen() {
             .join("xcshareddata/xcschemes/Location.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("LocationScenarioReference"));
-    assert!(scheme.contains("identifier=\"New York, NY, USA\""));
-    assert!(scheme.contains("referenceType=\"1\""));
+    assert!(xml_contains(&scheme, "LocationScenarioReference"));
+    assert!(xml_contains(&scheme, "identifier=\"New York, NY, USA\""));
+    assert!(xml_contains(&scheme, "referenceType=\"1\""));
 }
 
 #[test]
@@ -852,7 +982,7 @@ fn writer_generates_gpx_location_simulation_like_xcodegen() {
             .join("xcshareddata/xcschemes/Location.xcscheme"),
     )
     .unwrap();
-    assert!(scheme.contains("LocationScenarioReference"));
-    assert!(scheme.contains("identifier=\"../../File.gpx\""));
-    assert!(scheme.contains("referenceType=\"0\""));
+    assert!(xml_contains(&scheme, "LocationScenarioReference"));
+    assert!(xml_contains(&scheme, "identifier=\"../../File.gpx\""));
+    assert!(xml_contains(&scheme, "referenceType=\"0\""));
 }
