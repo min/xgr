@@ -225,11 +225,7 @@ fn collect_candidates(
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("");
-        if is_dir
-            && blacklisted_directories
-                .iter()
-                .any(|blacklisted| *blacklisted == name)
-        {
+        if is_dir && blacklisted_directories.contains(&name) {
             continue;
         }
         candidates.push((path.clone(), is_dir));
@@ -242,12 +238,7 @@ fn collect_candidates(
 fn matches_glob(pattern: &str, candidate: &str, behavior: GlobBehavior, is_dir: bool) -> bool {
     match behavior {
         GlobBehavior::Gradle => {
-            !is_dir
-                && glob_match(
-                    &pattern.replace("**/", "**").replace("/**", "/**"),
-                    candidate,
-                    true,
-                )
+            !is_dir && glob_match(&pattern.replace("**/", "**"), candidate, true)
         }
         GlobBehavior::BashV4 => glob_match(pattern, candidate, true),
         GlobBehavior::BashV3 => {

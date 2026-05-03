@@ -1,6 +1,6 @@
-use oxidegen::{Project, ProjectWriter};
 use serde_json::Value;
 use std::fs;
+use xcodegenrust::{Project, ProjectWriter};
 
 fn project_from_json(base_path: std::path::PathBuf, value: Value) -> Project {
     Project::from_dictionary(base_path, value.as_object().unwrap().clone()).unwrap()
@@ -536,7 +536,7 @@ fn writer_generates_scheme_management_for_hidden_target_scheme_like_xcodegen() {
     let management = fs::read_to_string(
         generated
             .project_path
-            .join("xcuserdata/oxidegen.xcuserdatad/xcschemes/xcschememanagement.plist"),
+            .join("xcuserdata/xcodegenrust.xcuserdatad/xcschemes/xcschememanagement.plist"),
     )
     .unwrap();
     assert!(management.contains("MyApp.xcscheme_^#shared#^_"));
@@ -584,6 +584,51 @@ fn writer_generates_scheme_without_debugger_for_test_like_xcodegen() {
     assert!(test_action.contains("selectedDebuggerIdentifier=\"\""));
     assert!(test_action
         .contains("selectedLauncherIdentifier=\"Xcode.IDEFoundation.Launcher.PosixSpawn\""));
+}
+
+#[test]
+fn writer_generates_checker_toggles_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "CheckerToggles",
+            "targets": {
+                "App": {"type": "application", "platform": "iOS"},
+                "Tests": {"type": "unitTestBundle", "platform": "iOS"}
+            },
+            "schemes": {
+                "CheckerScheme": {
+                    "build": {"targets": {"App": "all"}},
+                    "run": {
+                        "config": "Debug",
+                        "disableMainThreadChecker": true,
+                        "stopOnEveryMainThreadCheckerIssue": true,
+                        "disableThreadPerformanceChecker": true
+                    },
+                    "test": {
+                        "config": "Debug",
+                        "targets": ["Tests"],
+                        "disableMainThreadChecker": true,
+                        "stopOnEveryMainThreadCheckerIssue": true
+                    }
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::write(&project, None).unwrap();
+    let scheme = fs::read_to_string(
+        generated
+            .project_path
+            .join("xcshareddata/xcschemes/CheckerScheme.xcscheme"),
+    )
+    .unwrap();
+    assert!(scheme.contains("LaunchAction buildConfiguration=\"Debug\""));
+    assert!(scheme.contains("disableMainThreadChecker=\"YES\""));
+    assert!(scheme.contains("stopOnEveryMainThreadCheckerIssue=\"YES\""));
+    assert!(scheme.contains("disableThreadPerformanceChecker=\"YES\""));
+    assert!(scheme.contains("TestAction buildConfiguration=\"Debug\""));
 }
 
 #[test]

@@ -1,11 +1,11 @@
-use oxidegen::core::{
-    glob_paths, relative_path, Atomic, GlobBehavior, RelativePathError, SortedArray,
-};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::thread;
 use tempfile::TempDir;
+use xcodegenrust::core::{
+    glob_paths, relative_path, Atomic, GlobBehavior, RelativePathError, SortedArray,
+};
 
 #[test]
 fn sorted_array_matches_xcodegen_tests() {

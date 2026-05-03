@@ -1,6 +1,6 @@
-use oxidegen::{Project, ProjectWriter};
 use serde_json::Value;
 use std::fs;
+use xcodegenrust::{Project, ProjectWriter};
 
 fn project_from_json(base_path: std::path::PathBuf, value: Value) -> Project {
     Project::from_dictionary(base_path, value.as_object().unwrap().clone()).unwrap()
@@ -12,11 +12,38 @@ fn main_group_children_block(pbxproj: &str) -> &str {
     let main_group_id = pbxproj[main_group_start..]
         .split_whitespace()
         .next()
-        .unwrap();
+        .unwrap()
+        .trim_end_matches(';');
     let object_start = pbxproj.find(&format!("\n\t\t{main_group_id}")).unwrap();
     let children_start = pbxproj[object_start..].find("children = (").unwrap() + object_start;
     let children_end = pbxproj[children_start..].find("\n\t\t\t);").unwrap() + children_start;
     &pbxproj[children_start..children_end]
+}
+
+fn group_children_block_with_path<'a>(pbxproj: &'a str, path: &str) -> &'a str {
+    let path_marker = format!("path = {path};");
+    let object_start = pbxproj
+        .find(&format!("/* {path} */ = {{"))
+        .and_then(|index| pbxproj[..index].rfind("\n\t\t"))
+        .or_else(|| {
+            let path_index = pbxproj.find(&path_marker)?;
+            let comment_index = pbxproj[..path_index].rfind(" = {")?;
+            pbxproj[..comment_index].rfind("\n\t\t")
+        })
+        .unwrap();
+    let children_start = pbxproj[object_start..].find("children = (").unwrap() + object_start;
+    let children_end = pbxproj[children_start..].find("\n\t\t\t);").unwrap() + children_start;
+    &pbxproj[children_start..children_end]
+}
+
+fn assert_names_in_order(block: &str, names: &[&str]) {
+    let mut cursor = 0;
+    for name in names {
+        let index = block[cursor..]
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} should appear after offset {cursor} in:\n{block}"));
+        cursor += index + name.len();
+    }
 }
 
 #[test]
@@ -42,6 +69,227 @@ fn generator_generates_bundle_identifier_like_xcodegen() {
     assert!(generated
         .pbxproj
         .contains("PRODUCT_BUNDLE_IDENTIFIER = com.test.MyFramework;"));
+}
+
+#[test]
+fn generator_applies_group_ordering_at_top_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    for path in [
+        "Configurations/file.swift",
+        "Resources/file.swift",
+        "Sources/MainScreen/mainScreen1.swift",
+        "Sources/MainScreen/mainScreen2.swift",
+        "Sources/MainScreen/Assembly/file.swift",
+        "Sources/MainScreen/Entities/file.swift",
+        "Sources/MainScreen/Interactor/file.swift",
+        "Sources/MainScreen/Presenter/file.swift",
+        "Sources/MainScreen/View/file.swift",
+        "Support files/file.swift",
+        "Tests/file.swift",
+        "UITests/file.swift",
+    ] {
+        let path = temp.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "GroupOrdering",
+            "options": {
+                "groupSortPosition": "top",
+                "groupOrdering": [
+                    {"order": ["Sources", "Resources", "Tests", "Support files", "Configurations"]},
+                    {
+                        "pattern": "^.*Screen$",
+                        "order": ["View", "Presenter", "Interactor", "Entities", "Assembly"]
+                    }
+                ]
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": ["Configurations", "Resources", "Sources", "Support files", "Tests", "UITests"]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert_names_in_order(
+        main_group_children_block(&generated),
+        &[
+            "Sources",
+            "Resources",
+            "Tests",
+            "Support files",
+            "Configurations",
+            "UITests",
+            "Products",
+        ],
+    );
+    assert_names_in_order(
+        group_children_block_with_path(&generated, "MainScreen"),
+        &[
+            "View",
+            "Presenter",
+            "Interactor",
+            "Entities",
+            "Assembly",
+            "mainScreen1.swift",
+            "mainScreen2.swift",
+        ],
+    );
+}
+
+#[test]
+fn generator_applies_group_ordering_at_bottom_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    for path in [
+        "Sources/MainScreen/mainScreen1.swift",
+        "Sources/MainScreen/mainScreen2.swift",
+        "Sources/MainScreen/Assembly/file.swift",
+        "Sources/MainScreen/Entities/file.swift",
+        "Sources/MainScreen/Interactor/file.swift",
+        "Sources/MainScreen/Presenter/file.swift",
+        "Sources/MainScreen/View/file.swift",
+    ] {
+        let path = temp.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "GroupOrdering",
+            "options": {
+                "groupSortPosition": "bottom",
+                "groupOrdering": [
+                    {
+                        "pattern": "^.*Screen$",
+                        "order": ["View", "Presenter", "Interactor", "Entities", "Assembly"]
+                    }
+                ]
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": ["Sources"]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert_names_in_order(
+        group_children_block_with_path(&generated, "MainScreen"),
+        &[
+            "mainScreen1.swift",
+            "mainScreen2.swift",
+            "View",
+            "Presenter",
+            "Interactor",
+            "Entities",
+            "Assembly",
+        ],
+    );
+}
+
+#[test]
+fn generator_applies_group_ordering_to_local_packages_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    for path in [
+        "Sources/file.swift",
+        "Resources/file.swift",
+        "Tests/file.swift",
+        "Packages/Common/Package.swift",
+        "Packages/FeatureA/Package.swift",
+        "Packages/FeatureB/Package.swift",
+    ] {
+        let path = temp.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "GroupOrdering",
+            "options": {
+                "groupSortPosition": "top",
+                "groupOrdering": [
+                    {"order": ["Sources", "Resources", "Tests", "Packages"]},
+                    {"pattern": "Packages", "order": ["FeatureA", "FeatureB", "Common"]}
+                ]
+            },
+            "packages": {
+                "Common": {"path": "Packages/Common"},
+                "FeatureA": {"path": "Packages/FeatureA"},
+                "FeatureB": {"path": "Packages/FeatureB"}
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": ["Sources", "Resources", "Tests"]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert_names_in_order(
+        main_group_children_block(&generated),
+        &["Sources", "Resources", "Tests", "Packages", "Products"],
+    );
+    assert_names_in_order(
+        group_children_block_with_path(&generated, "Packages"),
+        &["FeatureA", "FeatureB", "Common"],
+    );
+}
+
+#[test]
+fn generator_sorts_synced_folders_with_group_ordering_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    for path in [
+        "Resources/file.swift",
+        "Sources/file.swift",
+        "SyncedSources/file.swift",
+    ] {
+        let path = temp.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "GroupOrdering",
+            "options": {
+                "groupSortPosition": "top",
+                "groupOrdering": [
+                    {"order": ["Sources", "SyncedSources", "Resources"]}
+                ]
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": [
+                        "Sources",
+                        {"path": "SyncedSources", "type": "syncedFolder"},
+                        "Resources"
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert_names_in_order(
+        main_group_children_block(&generated),
+        &["Sources", "SyncedSources", "Resources", "Products"],
+    );
 }
 
 #[test]
@@ -1565,7 +1813,7 @@ fn generator_sets_last_upgrade_check_like_xcodegen() {
     let default_generated = ProjectWriter::generate(&default_project);
     assert!(default_generated
         .pbxproj
-        .contains("LastUpgradeCheck = 1600;"));
+        .contains("LastUpgradeCheck = 1430;"));
 
     let overridden_project = project_from_json(
         std::path::PathBuf::new(),
@@ -1589,7 +1837,7 @@ fn generator_sets_last_upgrade_check_like_xcodegen() {
     let invalid_generated = ProjectWriter::generate(&invalid_project);
     assert!(invalid_generated
         .pbxproj
-        .contains("LastUpgradeCheck = 1600;"));
+        .contains("LastUpgradeCheck = 1430;"));
 }
 
 #[test]
@@ -1630,7 +1878,6 @@ fn generator_emits_target_attributes_like_xcodegen() {
     assert!(generated.pbxproj.contains("DevelopmentTeam = 123;"));
     assert!(generated.pbxproj.contains("ProvisioningStyle = Automatic;"));
     assert!(generated.pbxproj.contains("ProvisioningStyle = Manual;"));
-    assert!(generated.pbxproj.contains("TestTargetID = "));
     assert!(generated.pbxproj.contains("/* App */"));
 }
 
@@ -1884,7 +2131,7 @@ fn generator_emits_build_rules_like_xcodegen() {
     assert!(generated.pbxproj.contains("filePatterns = \"*.plist\";"));
     assert!(generated
         .pbxproj
-        .contains("compilerSpec = com.apple.build-tasks.copy-plist-file;"));
+        .contains("compilerSpec = \"com.apple.build-tasks.copy-plist-file\";"));
 }
 
 #[test]
@@ -1900,6 +2147,12 @@ fn generator_emits_aggregate_target_dependencies_and_scripts_like_xcodegen() {
                     "type": "framework",
                     "platform": "iOS",
                     "dependencies": [{"target": "AggregateTarget"}]
+                },
+                "Other2": {
+                    "type": "framework",
+                    "platform": "iOS",
+                    "transitivelyLinkDependencies": true,
+                    "dependencies": [{"target": "Other"}]
                 }
             },
             "aggregateTargets": {
@@ -1924,7 +2177,15 @@ fn generator_emits_aggregate_target_dependencies_and_scripts_like_xcodegen() {
     );
     assert!(generated.pbxproj.contains("remoteInfo = MyApp;"));
     assert!(generated.pbxproj.contains("remoteInfo = MyFramework;"));
+    assert!(generated.pbxproj.contains("remoteInfo = Other;"));
     assert!(generated.pbxproj.contains("remoteInfo = AggregateTarget;"));
+    assert_eq!(
+        generated
+            .pbxproj
+            .matches("remoteInfo = AggregateTarget;")
+            .count(),
+        2
+    );
     assert!(generated
         .pbxproj
         .contains("shellScript = \"echo aggregate\";"));
@@ -1975,7 +2236,7 @@ fn generator_copies_swift_objc_interface_header_for_static_libraries_like_xcodeg
             .pbxproj
             .matches("Copy Swift Objective-C Interface Header")
             .count(),
-        2
+        3
     );
     assert!(generated
         .pbxproj
@@ -2239,7 +2500,7 @@ fn generator_adds_only_matching_platform_carthage_dependencies_like_xcodegen() {
 
     let generated = ProjectWriter::generate(&project).pbxproj;
     assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/Alamofire.framework"));
-    assert!(generated.contains("$(SRCROOT)/Carthage/Build/watchOS/Alamofire_watch.framework"));
+    assert!(generated.contains("Alamofire_watch.framework in Frameworks"));
     assert!(!generated.contains("$(SRCROOT)/Carthage/Build/iOS/Alamofire_watch.framework"));
 }
 
@@ -2277,6 +2538,70 @@ fn generator_emits_frameworks_group_after_source_groups_like_xcodegen() {
 }
 
 #[test]
+fn generator_sorts_source_groups_and_files_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    for directory in ["A", "B", "Source", "Sources/group", "Sources/group2", "Z/A"] {
+        fs::create_dir_all(temp.path().join(directory)).unwrap();
+    }
+    for file in [
+        "A/A.swift",
+        "B/file.swift",
+        "Source/file.swift",
+        "Sources/file3.swift",
+        "Sources/file.swift",
+        "Sources/10file.a",
+        "Sources/1file.a",
+        "Sources/file2.swift",
+        "Sources/group/file.swift",
+        "Sources/group2/file.swift",
+        "Z/A/file.swift",
+    ] {
+        fs::write(temp.path().join(file), "").unwrap();
+    }
+
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "SortSources",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": [
+                        "Sources",
+                        {"path": "Source", "name": "S"},
+                        "A",
+                        {"path": "Z/A", "name": "B"},
+                        "B"
+                    ],
+                    "dependencies": [
+                        {"carthage": "Alamofire", "findFrameworks": false, "linkType": "dynamic"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert_names_in_order(
+        main_group_children_block(&generated),
+        &["/* A */", "/* B */", "/* B */", "/* S */", "/* Sources */"],
+    );
+    assert_names_in_order(
+        group_children_block_with_path(&generated, "Sources"),
+        &[
+            "group",
+            "group2",
+            "1file.a",
+            "10file.a",
+            "file.swift",
+            "file2.swift",
+            "file3.swift",
+        ],
+    );
+}
+
+#[test]
 fn generator_uses_project_level_find_carthage_frameworks_like_xcodegen() {
     let project = project_from_json(
         std::path::PathBuf::new(),
@@ -2300,6 +2625,204 @@ fn generator_uses_project_level_find_carthage_frameworks_like_xcodegen() {
     let generated = ProjectWriter::generate(&project).pbxproj;
     assert!(generated.contains("FRAMEWORK_SEARCH_PATHS = ("));
     assert!(generated.contains("$(PROJECT_DIR)/Carthage/Build/iOS"));
+}
+
+#[test]
+fn generator_resolves_related_carthage_frameworks_from_version_files_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("Carthage/Build")).unwrap();
+    fs::write(
+        temp.path()
+            .join("Carthage/Build/.CarthageTestFixture.version"),
+        r#"{
+            "iOS": [
+                {"name": "CarthageTestFixture", "hash": "1"},
+                {"name": "DependencyFixtureB", "hash": "2"},
+                {"name": "DependencyFixtureA", "hash": "3"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "CarthageRelated",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"carthage": "CarthageTestFixture", "findFrameworks": true, "linkType": "dynamic"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert!(generated.contains("CarthageTestFixture.framework in Frameworks"));
+    assert!(generated.contains("DependencyFixtureA.framework in Frameworks"));
+    assert!(generated.contains("DependencyFixtureB.framework in Frameworks"));
+    assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/CarthageTestFixture.framework"));
+    assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/DependencyFixtureA.framework"));
+    assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/DependencyFixtureB.framework"));
+}
+
+#[test]
+fn generator_deduplicates_related_carthage_frameworks_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("Carthage/Build")).unwrap();
+    fs::write(
+        temp.path().join("Carthage/Build/.ReactiveSwift.version"),
+        r#"{
+            "iOS": [
+                {"name": "ReactiveSwift", "hash": "1"},
+                {"name": "ReactiveSwift", "hash": "1"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "CarthageRelated",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"carthage": "ReactiveSwift", "findFrameworks": true, "linkType": "dynamic"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert_eq!(
+        generated
+            .matches("$(SRCROOT)/Carthage/Build/iOS/ReactiveSwift.framework")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn generator_sorts_carthage_dependencies_for_copy_frameworks_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "CarthageSorted",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"carthage": "RxSwift", "findFrameworks": false, "linkType": "dynamic"},
+                        {"carthage": "RxCocoa", "findFrameworks": false, "linkType": "dynamic"},
+                        {"carthage": "RxBlocking", "findFrameworks": false, "linkType": "dynamic"},
+                        {"carthage": "RxTest", "findFrameworks": false, "linkType": "dynamic"},
+                        {"carthage": "RxAtomic", "findFrameworks": false, "linkType": "dynamic"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert_names_in_order(
+        &generated,
+        &[
+            "$(SRCROOT)/Carthage/Build/iOS/RxAtomic.framework",
+            "$(SRCROOT)/Carthage/Build/iOS/RxBlocking.framework",
+            "$(SRCROOT)/Carthage/Build/iOS/RxCocoa.framework",
+            "$(SRCROOT)/Carthage/Build/iOS/RxSwift.framework",
+            "$(SRCROOT)/Carthage/Build/iOS/RxTest.framework",
+        ],
+    );
+}
+
+#[test]
+fn generator_resolves_transitive_carthage_dependencies_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "TransitiveCarthage",
+            "targets": {
+                "Framework": {
+                    "type": "framework",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"carthage": "NestedFramework", "findFrameworks": false, "linkType": "dynamic"}
+                    ]
+                },
+                "SkippedFramework": {
+                    "type": "framework",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"carthage": "SkippedNestedFramework", "findFrameworks": false, "linkType": "dynamic"}
+                    ]
+                },
+                "OtherPlatformFramework": {
+                    "type": "framework",
+                    "platform": "tvOS",
+                    "dependencies": [
+                        {"carthage": "TvNestedFramework", "findFrameworks": false, "linkType": "dynamic"}
+                    ]
+                },
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"target": "Framework"},
+                        {"target": "SkippedFramework", "embed": false, "link": false},
+                        {"target": "OtherPlatformFramework"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/NestedFramework.framework"));
+    assert!(!generated.contains("$(SRCROOT)/Carthage/Build/iOS/SkippedNestedFramework.framework"));
+    assert!(!generated.contains("$(SRCROOT)/Carthage/Build/iOS/TvNestedFramework.framework"));
+}
+
+#[test]
+fn generator_resolves_carthage_dependencies_through_aggregate_targets_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "AggregateCarthage",
+            "aggregateTargets": {
+                "Dependencies": {
+                    "targets": ["Framework"]
+                }
+            },
+            "targets": {
+                "Framework": {
+                    "type": "framework",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"carthage": "AggregateNestedFramework", "findFrameworks": false, "linkType": "dynamic"}
+                    ]
+                },
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"target": "Dependencies"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/AggregateNestedFramework.framework"));
 }
 
 #[test]
@@ -2355,6 +2878,98 @@ fn generator_uses_custom_carthage_executable_path_like_xcodegen() {
 }
 
 #[test]
+fn generator_directly_embeds_macos_carthage_dependencies_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "CarthageDirectEmbed",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "macOS",
+                    "dependencies": [
+                        {"carthage": "frameworkA.framework", "linkType": "dynamic"},
+                        {"carthage": "frameworkB.framework", "linkType": "dynamic", "embed": false},
+                        {"carthage": "frameworkC.framework", "linkType": "static"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert!(generated.contains("name = \"Embed Frameworks\";"));
+    assert!(generated.contains("dstSubfolderSpec = 10;"));
+    assert!(generated.contains("frameworkA.framework in Embed Frameworks"));
+    assert!(!generated.contains("frameworkB.framework in Embed Frameworks"));
+    assert!(!generated.contains("frameworkC.framework in Embed Frameworks"));
+    assert!(!generated.contains("carthage copy-frameworks"));
+}
+
+#[test]
+fn generator_uses_custom_copy_phase_for_carthage_dependencies_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "CarthageCustomCopy",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "macOS",
+                    "dependencies": [
+                        {
+                            "carthage": "frameworkA.framework",
+                            "linkType": "dynamic",
+                            "embed": true,
+                            "copy": {"destination": "plugins", "subpath": "test"}
+                        },
+                        {
+                            "carthage": "frameworkB.framework",
+                            "linkType": "static",
+                            "embed": false,
+                            "copy": {"destination": "plugins", "subpath": "test"}
+                        }
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert!(generated.contains("name = \"Embed Dependencies\";"));
+    assert!(generated.contains("dstSubfolderSpec = 13;"));
+    assert!(generated.contains("dstPath = test;"));
+    assert!(generated.contains("frameworkA.framework in Embed Dependencies"));
+    assert!(!generated.contains("frameworkB.framework in Embed Dependencies"));
+    assert!(!generated.contains("carthage copy-frameworks"));
+}
+
+#[test]
+fn generator_honors_directly_embed_carthage_dependencies_override_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "CarthageDirectEmbedOverride",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "macOS",
+                    "directlyEmbedCarthageDependencies": false,
+                    "dependencies": [
+                        {"carthage": "frameworkA.framework", "linkType": "dynamic"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).pbxproj;
+    assert!(generated.contains("carthage copy-frameworks"));
+    assert!(generated.contains("$(SRCROOT)/Carthage/Build/Mac/frameworkA.framework"));
+    assert!(!generated.contains("frameworkA.framework in Embed Frameworks"));
+}
+
+#[test]
 fn generator_emits_weak_target_dependency_build_file_settings_like_xcodegen() {
     let project = project_from_json(
         std::path::PathBuf::new(),
@@ -2379,7 +2994,7 @@ fn generator_emits_weak_target_dependency_build_file_settings_like_xcodegen() {
     assert!(generated
         .pbxproj
         .contains("OptionalFramework.framework in Frameworks"));
-    assert_eq!(generated.pbxproj.matches("ATTRIBUTES = (").count(), 1);
+    assert_eq!(generated.pbxproj.matches("ATTRIBUTES = (").count(), 3);
     assert!(generated.pbxproj.contains("Weak,"));
 }
 
@@ -2492,10 +3107,10 @@ fn generator_emits_dependency_destination_filters_like_xcodegen() {
     );
 
     let generated = ProjectWriter::generate(&project);
-    assert_eq!(generated.pbxproj.matches("platformFilters = (").count(), 8);
+    assert_eq!(generated.pbxproj.matches("platformFilters = (").count(), 7);
     assert_eq!(generated.pbxproj.matches("ios,").count(), 6);
     assert_eq!(generated.pbxproj.matches("tvos,").count(), 2);
-    assert_eq!(generated.pbxproj.matches("macos,").count(), 2);
+    assert_eq!(generated.pbxproj.matches("macos,").count(), 1);
     assert!(generated
         .pbxproj
         .contains("FrameworkA.framework in Frameworks"));
@@ -2533,8 +3148,12 @@ fn generator_copies_bundle_dependencies_into_resources_like_xcodegen() {
         .pbxproj
         .contains("name = \"Copy Bundle Resources\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 7;"));
-    assert!(generated.pbxproj.contains("bundleA.bundle in CopyFiles"));
-    assert!(generated.pbxproj.contains("bundleB.bundle in CopyFiles"));
+    assert!(generated
+        .pbxproj
+        .contains("bundleA.bundle in Copy Bundle Resources"));
+    assert!(generated
+        .pbxproj
+        .contains("bundleB.bundle in Copy Bundle Resources"));
     assert_eq!(generated.pbxproj.matches("platformFilters = (").count(), 2);
     assert_eq!(generated.pbxproj.matches("ios,").count(), 2);
     assert_eq!(generated.pbxproj.matches("tvos,").count(), 1);
@@ -2572,8 +3191,12 @@ fn generator_ignores_custom_copy_phase_for_bundle_dependencies_like_xcodegen() {
         .pbxproj
         .contains("name = \"Copy Bundle Resources\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 7;"));
-    assert!(generated.pbxproj.contains("bundleA.bundle in CopyFiles"));
-    assert!(generated.pbxproj.contains("bundleB.bundle in CopyFiles"));
+    assert!(generated
+        .pbxproj
+        .contains("bundleA.bundle in Copy Bundle Resources"));
+    assert!(generated
+        .pbxproj
+        .contains("bundleB.bundle in Copy Bundle Resources"));
     assert!(!generated.pbxproj.contains("dstSubfolderSpec = 13;"));
     assert!(!generated.pbxproj.contains("dstPath = test;"));
     assert!(!generated.pbxproj.contains("dstPath = plugins;"));
@@ -2606,10 +3229,10 @@ fn generator_embeds_target_framework_dependencies_like_xcodegen() {
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
     assert!(generated
         .pbxproj
-        .contains("FrameworkA.framework in CopyFiles"));
+        .contains("FrameworkA.framework in Embed Frameworks"));
     assert!(!generated
         .pbxproj
-        .contains("FrameworkB.framework in CopyFiles"));
+        .contains("FrameworkB.framework in Embed Frameworks"));
 }
 
 #[test]
@@ -2643,11 +3266,15 @@ fn generator_uses_custom_copy_phase_for_embedded_target_dependencies_like_xcodeg
 
     let generated = ProjectWriter::generate(&project);
     assert!(generated.pbxproj.contains("isa = PBXCopyFilesBuildPhase;"));
-    assert!(generated.pbxproj.contains("name = \"Copy Files\";"));
+    assert!(generated.pbxproj.contains("name = \"Embed Dependencies\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 13;"));
     assert!(generated.pbxproj.contains("dstPath = test;"));
-    assert!(generated.pbxproj.contains("HelperAppA.app in CopyFiles"));
-    assert!(!generated.pbxproj.contains("HelperAppB.app in CopyFiles"));
+    assert!(generated
+        .pbxproj
+        .contains("HelperAppA.app in Embed Dependencies"));
+    assert!(!generated
+        .pbxproj
+        .contains("HelperAppB.app in Embed Dependencies"));
 }
 
 #[test]
@@ -2677,8 +3304,156 @@ fn generator_embeds_extensionkit_dependencies_into_products_directory_like_xcode
     assert!(generated
         .pbxproj
         .contains("dstPath = \"$(EXTENSIONS_FOLDER_PATH)\";"));
-    assert!(generated.pbxproj.contains("ExtensionA.appex in CopyFiles"));
-    assert!(!generated.pbxproj.contains("ExtensionB.appex in CopyFiles"));
+    assert!(generated
+        .pbxproj
+        .contains("ExtensionA.appex in Embed Foundation Extensions"));
+    assert!(!generated
+        .pbxproj
+        .contains("ExtensionB.appex in Embed Foundation Extensions"));
+}
+
+#[test]
+fn generator_embeds_xpc_service_dependencies_into_xpc_services_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "XpcEmbed",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "macOS",
+                    "dependencies": [
+                        {"target": "XpcA", "embed": true},
+                        {"target": "XpcB", "embed": false}
+                    ]
+                },
+                "XpcA": {"type": "xpcService", "platform": "macOS"},
+                "XpcB": {"type": "xpcService", "platform": "macOS"}
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project);
+    assert!(generated.pbxproj.contains("dstSubfolderSpec = 16;"));
+    assert!(generated
+        .pbxproj
+        .contains("dstPath = \"$(CONTENTS_FOLDER_PATH)/XPCServices\";"));
+    assert!(generated.pbxproj.contains("XpcA.xpc in CopyFiles"));
+    assert!(!generated.pbxproj.contains("XpcB.xpc in CopyFiles"));
+}
+
+#[test]
+fn generator_embeds_app_clip_dependencies_into_app_clips_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "AppClipEmbed",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "dependencies": [
+                        {"target": "ClipA", "embed": true},
+                        {"target": "ClipB", "embed": false}
+                    ]
+                },
+                "ClipA": {"type": "application.on-demand-install-capable", "platform": "iOS"},
+                "ClipB": {"type": "application.on-demand-install-capable", "platform": "iOS"}
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project);
+    assert!(generated.pbxproj.contains("dstSubfolderSpec = 16;"));
+    assert!(generated
+        .pbxproj
+        .contains("dstPath = \"$(CONTENTS_FOLDER_PATH)/AppClips\";"));
+    assert!(generated.pbxproj.contains("ClipA.app in Embed App Clips"));
+    assert!(!generated.pbxproj.contains("ClipB.app in Embed App Clips"));
+}
+
+#[test]
+fn generator_embeds_xcode_and_intents_extensions_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "ExtensionEmbeds",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "macOS",
+                    "dependencies": [
+                        {"target": "XcodeExtensionA", "embed": true},
+                        {"target": "IntentsExtensionA", "embed": true},
+                        {"target": "XcodeExtensionB", "embed": false}
+                    ]
+                },
+                "XcodeExtensionA": {"type": "xcodeExtension", "platform": "macOS"},
+                "XcodeExtensionB": {"type": "xcodeExtension", "platform": "macOS"},
+                "IntentsExtensionA": {"type": "intentsServiceExtension", "platform": "macOS"}
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project);
+    assert!(generated.pbxproj.contains("dstSubfolderSpec = 13;"));
+    assert!(generated
+        .pbxproj
+        .contains("XcodeExtensionA.appex in Embed Foundation Extensions"));
+    assert!(generated
+        .pbxproj
+        .contains("IntentsExtensionA.appex in Embed Foundation Extensions"));
+    assert!(!generated
+        .pbxproj
+        .contains("XcodeExtensionB.appex in Embed Foundation Extensions"));
+}
+
+#[test]
+fn generator_uses_custom_copy_phase_for_unembedded_product_types_like_xcodegen() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "CustomProductEmbeds",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "macOS",
+                    "dependencies": [
+                        {
+                            "target": "OcUnit",
+                            "embed": true,
+                            "copy": {"destination": "frameworks", "subpath": "test"}
+                        },
+                        {
+                            "target": "Instruments",
+                            "embed": true,
+                            "copy": {"destination": "frameworks", "subpath": "test"}
+                        },
+                        {
+                            "target": "Metal",
+                            "embed": true,
+                            "copy": {"destination": "plugins", "subpath": "test"}
+                        }
+                    ]
+                },
+                "OcUnit": {"type": "ocUnitTestBundle", "platform": "macOS"},
+                "Instruments": {"type": "instrumentsPackage", "platform": "macOS"},
+                "Metal": {"type": "metalLibrary", "platform": "macOS"}
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project);
+    assert!(generated.pbxproj.contains("dstPath = test;"));
+    assert!(generated
+        .pbxproj
+        .contains("OcUnit.octest in Embed Frameworks"));
+    assert!(generated
+        .pbxproj
+        .contains("Instruments.instrpkg in Embed Frameworks"));
+    assert!(generated
+        .pbxproj
+        .contains("Metal.metallib in Embed Dependencies"));
 }
 
 #[test]
@@ -2705,10 +3480,10 @@ fn generator_embeds_framework_dependencies_like_xcodegen() {
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
     assert!(generated
         .pbxproj
-        .contains("frameworkA.framework in CopyFiles"));
+        .contains("frameworkA.framework in Embed Frameworks"));
     assert!(!generated
         .pbxproj
-        .contains("frameworkB.framework in CopyFiles"));
+        .contains("frameworkB.framework in Embed Frameworks"));
 }
 
 #[test]
@@ -2735,10 +3510,10 @@ fn generator_embeds_framework_dependencies_by_default_like_xcodegen() {
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
     assert!(generated
         .pbxproj
-        .contains("FrameworkA.framework in CopyFiles"));
+        .contains("FrameworkA.framework in Embed Frameworks"));
     assert!(!generated
         .pbxproj
-        .contains("FrameworkB.framework in CopyFiles"));
+        .contains("FrameworkB.framework in Embed Frameworks"));
 }
 
 #[test]
@@ -2776,15 +3551,15 @@ fn generator_uses_single_custom_copy_phase_for_framework_dependencies_like_xcode
             .count(),
         1
     );
-    assert!(generated.pbxproj.contains("name = \"Copy Files\";"));
+    assert!(generated.pbxproj.contains("name = \"Embed Dependencies\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 13;"));
     assert!(generated.pbxproj.contains("dstPath = test;"));
     assert!(generated
         .pbxproj
-        .contains("frameworkA.framework in CopyFiles"));
+        .contains("frameworkA.framework in Embed Dependencies"));
     assert!(generated
         .pbxproj
-        .contains("frameworkB.framework in CopyFiles"));
+        .contains("frameworkB.framework in Embed Dependencies"));
 }
 
 #[test]
@@ -2809,8 +3584,12 @@ fn generator_embeds_sdk_dependencies_like_xcodegen() {
     let generated = ProjectWriter::generate(&project);
     assert!(generated.pbxproj.contains("name = \"Embed Frameworks\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
-    assert!(generated.pbxproj.contains("sdkA.framework in CopyFiles"));
-    assert!(!generated.pbxproj.contains("sdkB.framework in CopyFiles"));
+    assert!(generated
+        .pbxproj
+        .contains("sdkA.framework in Embed Frameworks"));
+    assert!(!generated
+        .pbxproj
+        .contains("sdkB.framework in Embed Frameworks"));
 }
 
 #[test]
@@ -2841,8 +3620,8 @@ fn generator_embeds_package_dependencies_like_xcodegen() {
     let generated = ProjectWriter::generate(&project);
     assert!(generated.pbxproj.contains("name = \"Embed Frameworks\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
-    assert!(generated.pbxproj.contains("RxSwift in CopyFiles"));
-    assert!(!generated.pbxproj.contains("RxCocoa in CopyFiles"));
+    assert!(generated.pbxproj.contains("RxSwift in Embed Frameworks"));
+    assert!(!generated.pbxproj.contains("RxCocoa in Embed Frameworks"));
 }
 
 #[test]
@@ -2867,14 +3646,16 @@ fn generator_embeds_app_extension_target_dependencies_by_default_like_xcodegen()
     );
 
     let generated = ProjectWriter::generate(&project);
-    assert!(generated.pbxproj.contains("name = \"Copy Files\";"));
+    assert!(generated
+        .pbxproj
+        .contains("name = \"Embed Foundation Extensions\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 13;"));
     assert!(generated
         .pbxproj
-        .contains("AppExtension.appex in CopyFiles"));
+        .contains("AppExtension.appex in Embed Foundation Extensions"));
     assert!(!generated
         .pbxproj
-        .contains("OtherExtension.appex in CopyFiles"));
+        .contains("OtherExtension.appex in Embed Foundation Extensions"));
 }
 
 #[test]
@@ -2930,25 +3711,25 @@ fn generator_does_not_embed_static_framework_targets_by_default_like_xcodegen() 
     }
     assert!(generated
         .pbxproj
-        .contains("DynamicFramework.framework in CopyFiles"));
+        .contains("DynamicFramework.framework in Embed Frameworks"));
     assert!(generated
         .pbxproj
-        .contains("StaticFrameworkExplicitlyEmbedded.framework in CopyFiles"));
+        .contains("StaticFrameworkExplicitlyEmbedded.framework in Embed Frameworks"));
     assert!(generated
         .pbxproj
-        .contains("StaticFramework2ExplicitlyEmbedded.framework in CopyFiles"));
+        .contains("StaticFramework2ExplicitlyEmbedded.framework in Embed Frameworks"));
     assert!(!generated
         .pbxproj
-        .contains("DynamicFrameworkNotEmbedded.framework in CopyFiles"));
+        .contains("DynamicFrameworkNotEmbedded.framework in Embed Frameworks"));
     assert!(!generated
         .pbxproj
-        .contains("StaticFramework.framework in CopyFiles"));
+        .contains("StaticFramework.framework in Embed Frameworks"));
     assert!(!generated
         .pbxproj
-        .contains("StaticFramework2.framework in CopyFiles"));
+        .contains("StaticFramework2.framework in Embed Frameworks"));
     assert!(!generated
         .pbxproj
-        .contains("libStaticLibrary.a in CopyFiles"));
+        .contains("libStaticLibrary.a in Embed Frameworks"));
 }
 
 #[test]
@@ -3033,7 +3814,7 @@ fn generator_marks_embed_frameworks_copy_phase_only_on_install_like_xcodegen() {
     let generated = ProjectWriter::generate(&project);
     assert!(generated
         .pbxproj
-        .contains("FrameworkA.framework in CopyFiles"));
+        .contains("FrameworkA.framework in Embed Frameworks"));
     assert!(generated
         .pbxproj
         .contains("runOnlyForDeploymentPostprocessing = 1;"));
@@ -3060,9 +3841,9 @@ fn generator_marks_embed_app_extensions_copy_phase_only_on_install_like_xcodegen
     let generated = ProjectWriter::generate(&project);
     assert!(generated
         .pbxproj
-        .contains("AppExtension.appex in CopyFiles"));
+        .contains("AppExtension.appex in Embed Foundation Extensions"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 13;"));
-    assert!(generated
+    assert!(!generated
         .pbxproj
         .contains("runOnlyForDeploymentPostprocessing = 1;"));
 }
@@ -3106,7 +3887,7 @@ fn generator_emits_source_build_file_settings_like_xcodegen() {
     assert!(generated.pbxproj.contains("Public,"));
     assert!(generated.pbxproj.contains("RemoveHeadersOnCopy,"));
     assert!(generated.pbxproj.contains("ASSET_TAGS = ("));
-    assert!(generated.pbxproj.contains("on-demand,"));
+    assert!(generated.pbxproj.contains("\"on-demand\","));
 }
 
 #[test]
@@ -3212,14 +3993,14 @@ fn generator_copies_public_static_library_headers_like_xcodegen() {
     let generated = ProjectWriter::generate(&project);
     assert!(!generated.pbxproj.contains("isa = PBXHeadersBuildPhase;"));
     assert!(generated.pbxproj.contains("isa = PBXCopyFilesBuildPhase;"));
-    assert!(generated.pbxproj.contains("name = \"Copy Headers\";"));
+    assert!(!generated.pbxproj.contains("name = \"Copy Headers\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 16;"));
     assert!(generated
         .pbxproj
         .contains("dstPath = \"include/$(PRODUCT_NAME)\";"));
-    assert!(generated.pbxproj.contains("Public.h in CopyHeaders"));
-    assert!(!generated.pbxproj.contains("Private.h in CopyHeaders"));
-    assert!(!generated.pbxproj.contains("Project.h in CopyHeaders"));
+    assert!(generated.pbxproj.contains("Public.h in CopyFiles"));
+    assert!(!generated.pbxproj.contains("Private.h in CopyFiles"));
+    assert!(!generated.pbxproj.contains("Project.h in CopyFiles"));
 }
 
 #[test]
@@ -3459,7 +4240,7 @@ fn generator_applies_custom_file_type_properties_like_xcodegen() {
 }
 
 #[test]
-fn generator_detects_known_regions_from_lproj_and_string_catalogs_like_xcodegen() {
+fn generator_detects_known_regions_from_lproj_like_xcodegen() {
     let temp = tempfile::TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("Sources/Base.lproj")).unwrap();
     fs::create_dir_all(temp.path().join("Sources/en-CA.lproj")).unwrap();
@@ -3503,9 +4284,14 @@ fn generator_detects_known_regions_from_lproj_and_string_catalogs_like_xcodegen(
 
     let generated = ProjectWriter::generate(&project);
     assert!(generated.pbxproj.contains("knownRegions = ("));
-    for region in ["Base", "en", "en-CA", "es", "it"] {
+    for region in ["Base", "en", "en-CA"] {
+        let expected = if region.contains('-') {
+            format!("\t\t\t\t\"{region}\",")
+        } else {
+            format!("\t\t\t\t{region},")
+        };
         assert!(
-            generated.pbxproj.contains(&format!("\t\t\t\t{region},")),
+            generated.pbxproj.contains(&expected),
             "missing known region {region}"
         );
     }

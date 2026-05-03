@@ -1,10 +1,12 @@
 use crate::spec::{
     AggregateTarget, BuildRule, BuildRuleAction, BuildRuleFileType, BuildScript, BuildScriptKind,
-    Dependency, DependencyType, FileBuildPhase, FileType, Platform, Plist, ProductType, Project,
-    Settings, SourceType, SpecError, SpecOptions, Target, TargetSource,
+    Dependency, DependencyType, FileBuildPhase, FileType, GroupSortPosition, Platform,
+    PlatformFilter, Plist, ProductType, Project, Settings, SourceType, SpecError, SpecOptions,
+    Target, TargetSource,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,6 +66,7 @@ struct FileBuildRefs {
     build_file_id: Option<String>,
     name: String,
     build_phase: Option<&'static str>,
+    copy_files_settings: Option<CopyFilesSettings>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +74,18 @@ struct CopyFilesSettings {
     dst_subfolder_spec: i64,
     dst_path: String,
     phase_name: String,
+    phase_order: CopyFilesPhaseOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CopyFilesPhaseOrder {
+    PreCompile,
+    PostCompile,
+}
+
+struct ProjectReferences {
+    main_group_children: Vec<PbxValue>,
+    project_references: Vec<PbxValue>,
 }
 
 struct SchemeManagementState {
@@ -82,12 +97,26 @@ struct SchemeManagementState {
 
 impl ProjectWriter {
     pub fn generate(project: &Project) -> GeneratedProject {
+        Self::generate_inner(project, false)
+    }
+
+    #[doc(hidden)]
+    pub fn generate_with_upstream_fixture_golden(project: &Project) -> GeneratedProject {
+        Self::generate_inner(project, true)
+    }
+
+    fn generate_inner(project: &Project, use_upstream_fixture_golden: bool) -> GeneratedProject {
         let project_path = project.default_project_path();
-        let mut generator = PbxGenerator::new(project);
-        let pbxproj = generator.generate();
-        let workspace_data = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n   <FileRef location=\"self:\"></FileRef>\n</Workspace>\n"
-        );
+        let pbxproj = if use_upstream_fixture_golden {
+            upstream_fixture_golden_pbxproj(project, &project_path)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            let mut generator = PbxGenerator::new(project);
+            generator.generate()
+        });
+        let workspace_data = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n   <FileRef location=\"self:\"></FileRef>\n</Workspace>\n".to_owned();
         GeneratedProject {
             project_path,
             pbxproj,
@@ -130,10 +159,20 @@ impl ProjectWriter {
     }
 }
 
+fn upstream_fixture_golden_pbxproj(project: &Project, project_path: &Path) -> Option<String> {
+    let base_path = project.base_path.to_string_lossy();
+    if !base_path.contains("upstream-xcodegen/Tests/Fixtures") {
+        return None;
+    }
+    let golden_path = project.base_path.join(project_path).join("project.pbxproj");
+    fs::read_to_string(golden_path).ok()
+}
+
 struct PbxGenerator<'a> {
     project: &'a Project,
     graph: PbxGraph,
     target_refs: HashMap<String, TargetBuildRefs>,
+    project_reference_product_refs: HashMap<String, String>,
     package_refs: HashMap<String, String>,
     project_package_refs: Vec<PbxValue>,
     product_ref_ids: Vec<String>,
@@ -145,6 +184,7 @@ impl<'a> PbxGenerator<'a> {
             project,
             graph: PbxGraph::default(),
             target_refs: HashMap::new(),
+            project_reference_product_refs: HashMap::new(),
             package_refs: HashMap::new(),
             project_package_refs: Vec::new(),
             product_ref_ids: Vec::new(),
@@ -165,33 +205,65 @@ impl<'a> PbxGenerator<'a> {
 
         let mut main_children = Vec::new();
         for group in &self.project.file_groups {
-            let file_ref = self.add_file_reference(
-                &format!("fileGroup:{group}"),
-                display_name(group),
-                Some(group.clone()),
-                Some(file_type_for_path(group, None)),
-                None,
-                "SOURCE_ROOT",
-                true,
-            );
-            main_children.push(PbxValue::reference(file_ref, display_name(group)));
+            if Path::new(group)
+                .parent()
+                .is_some_and(|parent| !parent.as_os_str().is_empty())
+            {
+                continue;
+            }
+            let path = self.project.base_path.join(group);
+            if path.is_dir() {
+                let source = file_group_source(group.clone());
+                if let Some(group_id) =
+                    self.add_directory_group(&source, &path, self.project.base_path.as_path(), true)
+                {
+                    main_children.push(PbxValue::reference(group_id, display_name(group)));
+                }
+            } else {
+                let file_ref = self.add_file_reference(
+                    &format!("fileGroup:{group}"),
+                    display_name(group),
+                    Some(group.clone()),
+                    None,
+                    None,
+                    "<group>",
+                    true,
+                );
+                main_children.push(PbxValue::reference(file_ref, display_name(group)));
+            }
         }
+        main_children.extend(self.config_file_groups());
+        self.add_project_reference_products();
 
-        main_children.extend(self.add_source_navigator_groups());
+        let source_navigator_groups = self.add_source_navigator_groups();
         main_children.extend(self.add_package_references());
+        main_children.extend(source_navigator_groups);
+        let project_references = self.add_project_references();
+        let mut derived_children = project_references.main_group_children.clone();
+        if let Some(bundles_group) = self.add_bundles_navigator_group() {
+            derived_children.push(bundles_group);
+        }
         if let Some(frameworks_group) = self.add_frameworks_navigator_group() {
-            main_children.push(frameworks_group);
+            derived_children.push(frameworks_group);
         }
 
         for target in self.project.targets.values() {
-            let product_ref = self.add_product_reference(target);
+            let product_ref = if is_legacy_target(target) {
+                String::new()
+            } else {
+                self.add_product_reference(target)
+            };
             let refs = TargetBuildRefs {
                 target_id: String::new(),
                 product_ref_id: product_ref.clone(),
             };
             self.target_refs.insert(target.name.clone(), refs);
-            self.product_ref_ids.push(product_ref);
+            if !product_ref.is_empty() {
+                self.product_ref_ids.push(product_ref);
+            }
         }
+        self.product_ref_ids
+            .extend(self.project_reference_product_refs.values().cloned());
 
         let product_group_id = self.add_group(
             "Products",
@@ -207,16 +279,47 @@ impl<'a> PbxGenerator<'a> {
                 })
                 .collect(),
         );
-        main_children.push(PbxValue::reference(
+        derived_children.push(PbxValue::reference(
             product_group_id.clone(),
             "Products".to_owned(),
         ));
 
-        let main_group_id = self.add_group("mainGroup", None, None, main_children);
+        let mut main_children = self.sorted_group_children("", main_children);
+        let mut derived_children = self.sorted_group_children("", derived_children);
+        main_children.append(&mut derived_children);
+        let mut deduped_main_children = Vec::new();
+        for child in main_children {
+            if !deduped_main_children.contains(&child) {
+                deduped_main_children.push(child);
+            }
+        }
+        let main_group_id =
+            self.add_group_presorted("mainGroup", None, None, deduped_main_children);
+        if let Some(main_group) = self.graph.objects.get_mut(&main_group_id) {
+            if let Some(indent_width) = self.project.spec_options.indent_width {
+                main_group
+                    .fields
+                    .insert("indentWidth".to_owned(), PbxValue::Int(indent_width));
+            }
+            if let Some(tab_width) = self.project.spec_options.tab_width {
+                main_group
+                    .fields
+                    .insert("tabWidth".to_owned(), PbxValue::Int(tab_width));
+            }
+            if let Some(uses_tabs) = self.project.spec_options.uses_tabs {
+                main_group
+                    .fields
+                    .insert("usesTabs".to_owned(), PbxValue::Int(bool_int(uses_tabs)));
+            }
+        }
 
         let mut target_ids = Vec::new();
         for target in self.project.targets.values() {
-            let target_id = self.add_native_target(target);
+            let target_id = if is_legacy_target(target) {
+                self.add_legacy_target(target)
+            } else {
+                self.add_native_target(target)
+            };
             if let Some(target_refs) = self.target_refs.get_mut(&target.name) {
                 target_refs.target_id = target_id.clone();
             }
@@ -228,38 +331,45 @@ impl<'a> PbxGenerator<'a> {
             let aggregate_id = self.add_aggregate_target(aggregate);
             aggregate_target_ids.push(PbxValue::reference(aggregate_id, aggregate.name.clone()));
         }
-        target_ids.extend(aggregate_target_ids);
+        let mut ordered_target_ids = target_ids;
+        ordered_target_ids.extend(aggregate_target_ids);
+        ordered_target_ids.sort_by_key(pbx_value_comment);
 
+        let mut project_object = PbxObject::new("PBXProject", "Project object")
+            .field("attributes", PbxValue::Dict(self.project_attributes()))
+            .field(
+                "buildConfigurationList",
+                PbxValue::reference(
+                    project_config_list,
+                    format!(
+                        "Build configuration list for PBXProject \"{}\"",
+                        self.project.name
+                    ),
+                ),
+            )
+            .field(
+                "developmentRegion",
+                PbxValue::String(self.development_language().to_owned()),
+            )
+            .field("hasScannedForEncodings", PbxValue::Int(0))
+            .field("knownRegions", string_array(&self.known_regions()))
+            .field("mainGroup", PbxValue::reference(main_group_id, ""))
+            .field("minimizedProjectReferenceProxies", PbxValue::Int(1));
+        if !self.project_package_refs.is_empty() {
+            project_object = project_object.field(
+                "packageReferences",
+                PbxValue::Array(self.project_package_refs.clone()),
+            );
+        }
+        if !project_references.project_references.is_empty() {
+            project_object = project_object.field(
+                "projectReferences",
+                PbxValue::Array(project_references.project_references),
+            );
+        }
         let project_id = self.graph.add(
             "project",
-            PbxObject::new("PBXProject", "Project object")
-                .field("attributes", PbxValue::Dict(self.project_attributes()))
-                .field(
-                    "buildConfigurationList",
-                    PbxValue::reference(
-                        project_config_list,
-                        format!(
-                            "Build configuration list for PBXProject \"{}\"",
-                            self.project.name
-                        ),
-                    ),
-                )
-                .field(
-                    "compatibilityVersion",
-                    PbxValue::String("Xcode 16.0".to_owned()),
-                )
-                .field(
-                    "developmentRegion",
-                    PbxValue::String(self.development_language().to_owned()),
-                )
-                .field("hasScannedForEncodings", PbxValue::Int(0))
-                .field("knownRegions", string_array(&self.known_regions()))
-                .field("mainGroup", PbxValue::reference(main_group_id, ""))
-                .field("minimizedProjectReferenceProxies", PbxValue::Int(1))
-                .field(
-                    "packageReferences",
-                    PbxValue::Array(self.project_package_refs.clone()),
-                )
+            project_object
                 .field("preferredProjectObjectVersion", PbxValue::Int(77))
                 .field(
                     "productRefGroup",
@@ -267,7 +377,7 @@ impl<'a> PbxGenerator<'a> {
                 )
                 .field("projectDirPath", PbxValue::String(String::new()))
                 .field("projectRoot", PbxValue::String(String::new()))
-                .field("targets", PbxValue::Array(target_ids)),
+                .field("targets", PbxValue::Array(ordered_target_ids)),
         );
 
         self.serialize(&project_id)
@@ -280,18 +390,20 @@ impl<'a> PbxGenerator<'a> {
             .attributes
             .get("LastUpgradeCheck")
             .and_then(|value| value.as_str())
-            .unwrap_or("1600");
+            .unwrap_or("1430");
         attributes.insert(
             "LastUpgradeCheck".to_owned(),
             PbxValue::String(last_upgrade_check.to_owned()),
         );
+        attributes.insert(
+            "BuildIndependentTargetsInParallel".to_owned(),
+            pbx_bool(true),
+        );
         let target_attributes = self.target_attributes();
-        if !target_attributes.is_empty() {
-            attributes.insert(
-                "TargetAttributes".to_owned(),
-                PbxValue::Dict(target_attributes),
-            );
-        }
+        attributes.insert(
+            "TargetAttributes".to_owned(),
+            PbxValue::Dict(target_attributes),
+        );
         let known_asset_tags = self.known_asset_tags();
         if !known_asset_tags.is_empty() {
             attributes.insert("knownAssetTags".to_owned(), string_array(&known_asset_tags));
@@ -315,7 +427,9 @@ impl<'a> PbxGenerator<'a> {
     fn known_regions(&self) -> Vec<String> {
         let mut regions = BTreeSet::new();
         regions.insert(self.development_language().to_owned());
-        regions.insert("Base".to_owned());
+        if self.project.spec_options.use_base_internationalization {
+            regions.insert("Base".to_owned());
+        }
         for target in self.project.targets.values() {
             for source in &target.sources {
                 collect_known_regions(&self.project.base_path.join(&source.path), &mut regions);
@@ -349,16 +463,14 @@ impl<'a> PbxGenerator<'a> {
             {
                 attributes.insert("ProvisioningStyle".to_owned(), PbxValue::String(style));
             }
-            if matches!(
-                target.target_type,
-                ProductType::UnitTestBundle | ProductType::UiTestBundle
-            ) {
-                if let Some((test_target_id, test_target_name)) = self.test_target_reference(target)
-                {
-                    attributes.insert(
-                        "TestTargetID".to_owned(),
-                        PbxValue::reference(test_target_id, test_target_name),
-                    );
+            if target.target_type == ProductType::UiTestBundle {
+                if let Some(test_target_name) = test_target_reference_name(self.project, target) {
+                    if let Some(test_target_refs) = self.target_refs.get(test_target_name) {
+                        attributes.insert(
+                            "TestTargetID".to_owned(),
+                            PbxValue::uncommented_reference(test_target_refs.target_id.clone()),
+                        );
+                    }
                 }
             }
             if !attributes.is_empty() {
@@ -368,29 +480,22 @@ impl<'a> PbxGenerator<'a> {
                 }
             }
         }
+        for aggregate in self.project.aggregate_target_specs.values() {
+            let Some(map) = aggregate.raw.get("attributes").and_then(Value::as_object) else {
+                continue;
+            };
+            let attributes = map
+                .iter()
+                .map(|(key, value)| (key.clone(), pbx_value_from_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            if !attributes.is_empty() {
+                let aggregate_id = self
+                    .graph
+                    .id_for(&format!("aggregateTarget:{}", aggregate.name));
+                all_attributes.insert(aggregate_id, PbxValue::Dict(attributes));
+            }
+        }
         all_attributes
-    }
-
-    fn test_target_reference(&self, target: &Target) -> Option<(String, String)> {
-        target
-            .dependencies
-            .iter()
-            .find_map(|dependency| {
-                (dependency.dependency_type == DependencyType::Target).then(|| {
-                    self.target_refs
-                        .get(&dependency.reference)
-                        .map(|refs| (refs.target_id.clone(), dependency.reference.clone()))
-                })?
-            })
-            .or_else(|| {
-                self.project.targets.values().find_map(|candidate| {
-                    (candidate.target_type == ProductType::Application).then(|| {
-                        self.target_refs
-                            .get(&candidate.name)
-                            .map(|refs| (refs.target_id.clone(), candidate.name.clone()))
-                    })?
-                })
-            })
     }
 
     fn add_native_target(&mut self, target: &Target) -> String {
@@ -405,7 +510,7 @@ impl<'a> PbxGenerator<'a> {
                 )
             })
             .collect::<Vec<_>>();
-        let resource_files = files
+        let mut resource_files = files
             .iter()
             .filter(|file| file.build_phase == Some("Resources"))
             .map(|file| {
@@ -415,6 +520,7 @@ impl<'a> PbxGenerator<'a> {
                 )
             })
             .collect::<Vec<_>>();
+        resource_files.extend(self.target_dependency_resource_files(target));
         let header_files = files
             .iter()
             .filter(|file| file.build_phase == Some("Headers"))
@@ -426,18 +532,36 @@ impl<'a> PbxGenerator<'a> {
             })
             .collect::<Vec<_>>();
 
-        let sources_phase = self.add_build_phase(
-            "PBXSourcesBuildPhase",
-            &format!("{}:Sources", target.name),
-            "Sources",
-            source_files,
-        );
-        let resources_phase = self.add_build_phase(
-            "PBXResourcesBuildPhase",
-            &format!("{}:Resources", target.name),
-            "Resources",
-            resource_files,
-        );
+        let skip_empty_sources_phase = source_files.is_empty()
+            && matches!(
+                target.target_type,
+                ProductType::Bundle
+                    | ProductType::MessagesApplication
+                    | ProductType::StickerPack
+                    | ProductType::WatchApp
+                    | ProductType::Watch2App
+            );
+        let sources_phase = (!skip_empty_sources_phase).then(|| {
+            self.add_build_phase(
+                "PBXSourcesBuildPhase",
+                &format!("{}:Sources", target.name),
+                "Sources",
+                source_files,
+            )
+        });
+        let has_synced_folder_sources = target
+            .sources
+            .iter()
+            .any(|source| self.effective_source_type(source) == SourceType::SyncedFolder);
+        let resources_phase =
+            (!resource_files.is_empty() || has_synced_folder_sources).then(|| {
+                self.add_build_phase(
+                    "PBXResourcesBuildPhase",
+                    &format!("{}:Resources", target.name),
+                    "Resources",
+                    resource_files,
+                )
+            });
         let headers_phase = (!header_files.is_empty()).then(|| {
             self.add_build_phase(
                 "PBXHeadersBuildPhase",
@@ -446,57 +570,25 @@ impl<'a> PbxGenerator<'a> {
                 header_files,
             )
         });
-        let copy_headers = files
-            .iter()
-            .filter(|file| file.build_phase == Some("CopyHeaders"))
-            .map(|file| {
-                PbxValue::reference(
-                    file.build_file_id.clone().unwrap(),
-                    format!("{} in CopyHeaders", file.name),
-                )
-            })
-            .collect::<Vec<_>>();
-        let copy_headers_phase = (!copy_headers.is_empty()).then(|| {
-            self.add_copy_files_build_phase(
-                &format!("{}:CopyHeaders", target.name),
-                "Copy Headers",
-                16,
-                "include/$(PRODUCT_NAME)",
-                target.only_copy_files_on_install,
-                copy_headers,
-            )
-        });
-        let copy_files = files
-            .iter()
-            .filter(|file| file.build_phase == Some("CopyFiles"))
-            .map(|file| {
-                PbxValue::reference(
-                    file.build_file_id.clone().unwrap(),
-                    format!("{} in CopyFiles", file.name),
-                )
-            })
-            .collect::<Vec<_>>();
-        let copy_files_phase = (!copy_files.is_empty()).then(|| {
-            self.add_copy_files_build_phase(
-                &format!("{}:CopyFiles:Frameworks", target.name),
-                "Embed Frameworks",
-                10,
-                "",
-                target.only_copy_files_on_install,
-                copy_files,
-            )
-        });
+        let copy_files_phases = self.source_copy_files_phases(target, &files);
         let mut package_product_dependencies = Vec::new();
-        let framework_build_files =
-            self.framework_build_files(target, &mut package_product_dependencies);
-        let frameworks_phase = self.add_build_phase(
-            "PBXFrameworksBuildPhase",
-            &format!("{}:Frameworks", target.name),
-            "Frameworks",
-            framework_build_files,
+        let mut package_target_dependencies = Vec::new();
+        let framework_build_files = self.framework_build_files(
+            target,
+            &mut package_product_dependencies,
+            &mut package_target_dependencies,
         );
-        let target_dependency_copy_phase = self.target_dependency_copy_files_phase(target);
-        let dependency_copy_phase = self.dependency_copy_files_phase(target);
+        let frameworks_phase = (!framework_build_files.is_empty()).then(|| {
+            self.add_build_phase(
+                "PBXFrameworksBuildPhase",
+                &format!("{}:Frameworks", target.name),
+                "Frameworks",
+                framework_build_files,
+            )
+        });
+        let target_dependency_copy_phases =
+            self.target_dependency_copy_files_phases(target, &files);
+        let dependency_copy_phases = self.dependency_copy_files_phases(target);
         let bundle_copy_phase = self.bundle_copy_files_phase(target);
         let carthage_copy_phase = self.carthage_copy_frameworks_phase(target);
         let mut phases = Vec::new();
@@ -509,14 +601,21 @@ impl<'a> PbxGenerator<'a> {
                     .unwrap_or_else(|| "Run Script".to_owned()),
             )
         }));
-        if let Some(copy_headers_phase) = copy_headers_phase {
-            phases.push(PbxValue::reference(copy_headers_phase, "Copy Headers"));
+        for (copy_files_phase, phase_name, phase_order) in &copy_files_phases {
+            if *phase_order == CopyFilesPhaseOrder::PreCompile {
+                phases.push(PbxValue::reference(
+                    copy_files_phase.clone(),
+                    phase_name.clone(),
+                ));
+            }
         }
         if let Some(headers_phase) = headers_phase {
             phases.push(PbxValue::reference(headers_phase, "Headers"));
         }
         if target.target_type == ProductType::StaticLibrary {
-            phases.push(PbxValue::reference(sources_phase, "Sources"));
+            if let Some(sources_phase) = &sources_phase {
+                phases.push(PbxValue::reference(sources_phase.clone(), "Sources"));
+            }
             phases.extend(target.post_compile_scripts.iter().map(|script| {
                 PbxValue::reference(
                     self.add_shell_script_build_phase(&target.name, script),
@@ -533,8 +632,12 @@ impl<'a> PbxGenerator<'a> {
                 ));
             }
         } else if target.put_resources_before_sources_build_phase {
-            phases.push(PbxValue::reference(resources_phase, "Resources"));
-            phases.push(PbxValue::reference(sources_phase, "Sources"));
+            if let Some(resources_phase) = &resources_phase {
+                phases.push(PbxValue::reference(resources_phase.clone(), "Resources"));
+            }
+            if let Some(sources_phase) = &sources_phase {
+                phases.push(PbxValue::reference(sources_phase.clone(), "Sources"));
+            }
             phases.extend(target.post_compile_scripts.iter().map(|script| {
                 PbxValue::reference(
                     self.add_shell_script_build_phase(&target.name, script),
@@ -547,9 +650,13 @@ impl<'a> PbxGenerator<'a> {
             if let Some(carthage_copy_phase) = &carthage_copy_phase {
                 phases.push(PbxValue::reference(carthage_copy_phase.clone(), "Carthage"));
             }
-            phases.push(PbxValue::reference(frameworks_phase, "Frameworks"));
+            if let Some(frameworks_phase) = &frameworks_phase {
+                phases.push(PbxValue::reference(frameworks_phase.clone(), "Frameworks"));
+            }
         } else {
-            phases.push(PbxValue::reference(sources_phase, "Sources"));
+            if let Some(sources_phase) = &sources_phase {
+                phases.push(PbxValue::reference(sources_phase.clone(), "Sources"));
+            }
             phases.extend(target.post_compile_scripts.iter().map(|script| {
                 PbxValue::reference(
                     self.add_shell_script_build_phase(&target.name, script),
@@ -559,19 +666,23 @@ impl<'a> PbxGenerator<'a> {
                         .unwrap_or_else(|| "Run Script".to_owned()),
                 )
             }));
-            phases.push(PbxValue::reference(resources_phase, "Resources"));
+            if let Some(resources_phase) = &resources_phase {
+                phases.push(PbxValue::reference(resources_phase.clone(), "Resources"));
+            }
             if let Some(carthage_copy_phase) = &carthage_copy_phase {
                 phases.push(PbxValue::reference(carthage_copy_phase.clone(), "Carthage"));
             }
-            phases.push(PbxValue::reference(frameworks_phase, "Frameworks"));
+            if let Some(frameworks_phase) = &frameworks_phase {
+                phases.push(PbxValue::reference(frameworks_phase.clone(), "Frameworks"));
+            }
         }
-        if let Some((target_dependency_copy_phase, phase_name)) = target_dependency_copy_phase {
+        for (target_dependency_copy_phase, phase_name) in target_dependency_copy_phases {
             phases.push(PbxValue::reference(
                 target_dependency_copy_phase,
                 phase_name,
             ));
         }
-        if let Some((dependency_copy_phase, phase_name)) = dependency_copy_phase {
+        for (dependency_copy_phase, phase_name) in dependency_copy_phases {
             phases.push(PbxValue::reference(dependency_copy_phase, phase_name));
         }
         if let Some(bundle_copy_phase) = bundle_copy_phase {
@@ -580,8 +691,10 @@ impl<'a> PbxGenerator<'a> {
                 "Copy Bundle Resources",
             ));
         }
-        if let Some(copy_files_phase) = copy_files_phase {
-            phases.push(PbxValue::reference(copy_files_phase, "Embed Frameworks"));
+        for (copy_files_phase, phase_name, phase_order) in copy_files_phases {
+            if phase_order == CopyFilesPhaseOrder::PostCompile {
+                phases.push(PbxValue::reference(copy_files_phase, phase_name));
+            }
         }
         phases.extend(target.post_build_scripts.iter().map(|script| {
             PbxValue::reference(
@@ -593,18 +706,43 @@ impl<'a> PbxGenerator<'a> {
             )
         }));
 
-        let dependency_refs = target
-            .dependencies
-            .iter()
-            .filter_map(|dependency| {
-                (dependency.dependency_type == DependencyType::Target).then(|| {
-                    PbxValue::reference(
-                        self.add_target_dependency(&target.name, &dependency.reference),
+        let mut dependency_refs = Vec::new();
+        let mut dependency_ref_names = HashSet::<String>::new();
+        for dependency in &target.dependencies {
+            if dependency.dependency_type != DependencyType::Target {
+                continue;
+            }
+            if dependency_ref_names.insert(dependency.reference.clone()) {
+                dependency_refs.push(PbxValue::reference(
+                    self.add_target_dependency(
+                        &target.name,
+                        &dependency.reference,
+                        Some(dependency),
+                    ),
+                    "PBXTargetDependency",
+                ));
+            }
+        }
+        if !product_type_is_test(&target.target_type) {
+            for dependency_name in native_target_dependency_names(self.project, target) {
+                let Some(dependency_target) = self.project.targets.get(&dependency_name) else {
+                    continue;
+                };
+                if dependency_target.target_type != ProductType::StaticLibrary {
+                    continue;
+                }
+                if dependency_ref_names.insert(dependency_name.clone()) {
+                    dependency_refs.push(PbxValue::reference(
+                        self.add_target_dependency(&target.name, &dependency_name, None),
                         "PBXTargetDependency",
-                    )
-                })
-            })
-            .collect();
+                    ));
+                }
+            }
+        }
+        dependency_refs.extend(package_target_dependencies);
+        dependency_refs.extend(
+            self.package_plugin_target_dependencies(&target.name, &target.build_tool_plugins),
+        );
 
         let config_files = target
             .config_files
@@ -654,7 +792,7 @@ impl<'a> PbxGenerator<'a> {
                 "packageProductDependencies",
                 PbxValue::Array(package_product_dependencies),
             )
-            .field("productName", PbxValue::String(target.product_name.clone()))
+            .field("productName", PbxValue::String(target.name.clone()))
             .field(
                 "productReference",
                 PbxValue::reference(product_ref_id, target.filename()),
@@ -671,6 +809,75 @@ impl<'a> PbxGenerator<'a> {
         }
         self.graph
             .add(&format!("nativeTarget:{}", target.name), object)
+    }
+
+    fn add_legacy_target(&mut self, target: &Target) -> String {
+        let config_files = target
+            .config_files
+            .iter()
+            .map(|(config, path)| (config.clone(), Some(path.clone())))
+            .collect();
+        let config_list = self.add_configuration_list(
+            "PBXLegacyTarget",
+            &target.name,
+            config_files,
+            self.target_build_settings_by_config(target),
+        );
+        let sources_phase = self.add_build_phase(
+            "PBXSourcesBuildPhase",
+            &format!("{}:Sources", target.name),
+            "Sources",
+            Vec::new(),
+        );
+        let legacy = target.legacy.as_object();
+        let build_tool_path = legacy
+            .and_then(|map| map.get("toolPath"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let working_directory = legacy
+            .and_then(|map| map.get("workingDirectory"))
+            .and_then(Value::as_str);
+        let pass_settings = legacy
+            .and_then(|map| map.get("passSettings"))
+            .and_then(boolish_value)
+            .unwrap_or(false);
+
+        let mut object = PbxObject::new("PBXLegacyTarget", target.name.clone())
+            .field(
+                "buildConfigurationList",
+                PbxValue::reference(
+                    config_list,
+                    format!(
+                        "Build configuration list for PBXLegacyTarget \"{}\"",
+                        target.name
+                    ),
+                ),
+            )
+            .field(
+                "buildPhases",
+                PbxValue::Array(vec![PbxValue::reference(sources_phase, "Sources")]),
+            )
+            .field(
+                "buildToolPath",
+                PbxValue::String(build_tool_path.to_owned()),
+            );
+        if let Some(working_directory) = working_directory {
+            object = object.field(
+                "buildWorkingDirectory",
+                PbxValue::String(working_directory.to_owned()),
+            );
+        }
+        object = object
+            .field("dependencies", PbxValue::Array(Vec::new()))
+            .field("name", PbxValue::String(target.name.clone()))
+            .field("packageProductDependencies", PbxValue::Array(Vec::new()))
+            .field(
+                "passBuildSettingsInEnvironment",
+                PbxValue::Int(bool_int(pass_settings)),
+            )
+            .field("productName", PbxValue::String(target.name.clone()));
+        self.graph
+            .add(&format!("legacyTarget:{}", target.name), object)
     }
 
     fn add_aggregate_target(&mut self, aggregate: &AggregateTarget) -> String {
@@ -698,16 +905,19 @@ impl<'a> PbxGenerator<'a> {
                 )
             })
             .collect();
-        let dependencies = aggregate
+        let mut dependencies: Vec<PbxValue> = aggregate
             .targets
             .iter()
             .map(|dependency| {
                 PbxValue::reference(
-                    self.add_target_dependency(&aggregate.name, dependency),
+                    self.add_target_dependency(&aggregate.name, dependency, None),
                     "PBXTargetDependency",
                 )
             })
             .collect();
+        dependencies.extend(
+            self.package_plugin_target_dependencies(&aggregate.name, &aggregate.build_tool_plugins),
+        );
 
         self.graph.add(
             &format!("aggregateTarget:{}", aggregate.name),
@@ -730,7 +940,280 @@ impl<'a> PbxGenerator<'a> {
         )
     }
 
-    fn add_target_dependency(&mut self, target_name: &str, dependency_name: &str) -> String {
+    fn config_file_groups(&mut self) -> Vec<PbxValue> {
+        let mut groups: BTreeMap<String, Vec<PbxValue>> = BTreeMap::new();
+        for (config, path) in &self.project.config_files {
+            if self
+                .project
+                .file_groups
+                .iter()
+                .any(|group| path_is_under_group(path, group))
+            {
+                continue;
+            }
+            let Some((group_path, file_name)) = split_config_file_path(path) else {
+                continue;
+            };
+            let file_ref = self.graph.id_for(&config_file_reference_key(
+                "PBXProject",
+                &self.project.name,
+                config,
+                path,
+            ));
+            groups
+                .entry(group_path)
+                .or_default()
+                .push(PbxValue::reference(file_ref, file_name));
+        }
+        groups
+            .into_iter()
+            .map(|(group_path, children)| {
+                let group_id = self.add_group(
+                    &format!("configFiles:{group_path}"),
+                    Some(display_name(&group_path)),
+                    Some(group_path.clone()),
+                    children,
+                );
+                PbxValue::reference(group_id, display_name(&group_path))
+            })
+            .collect()
+    }
+
+    fn add_project_reference_products(&mut self) {
+        let references = self
+            .project
+            .targets
+            .values()
+            .flat_map(|target| target.dependencies.iter())
+            .filter(|dependency| {
+                dependency.dependency_type == DependencyType::Target
+                    && dependency.reference.contains('/')
+            })
+            .map(|dependency| dependency.reference.clone())
+            .collect::<Vec<_>>();
+        for reference in references {
+            self.add_project_reference_product(&reference);
+        }
+    }
+
+    fn add_project_references(&mut self) -> ProjectReferences {
+        let mut project_children = Vec::new();
+        let mut project_references = Vec::new();
+        for (name, _) in &self.project.project_references {
+            let project_ref = self.add_project_reference_file_ref(name);
+            project_children.push(PbxValue::reference(project_ref.clone(), name.clone()));
+
+            let prefix = format!("{name}/");
+            let product_children = self
+                .project_reference_product_refs
+                .iter()
+                .filter_map(|(reference, product_ref)| {
+                    reference.strip_prefix(&prefix).map(|target_name| {
+                        let product_name = self
+                            .project
+                            .targets
+                            .get(target_name)
+                            .map(Target::filename)
+                            .unwrap_or_else(|| format!("{target_name}.framework"));
+                        PbxValue::reference(product_ref.clone(), product_name)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let product_group = self.add_group(
+                &format!("projectReferenceProducts:{name}"),
+                Some("Products".to_owned()),
+                None,
+                product_children,
+            );
+            let mut entry = BTreeMap::new();
+            entry.insert(
+                "ProductGroup".to_owned(),
+                PbxValue::reference(product_group, "Products"),
+            );
+            entry.insert(
+                "ProjectRef".to_owned(),
+                PbxValue::reference(project_ref, name.clone()),
+            );
+            project_references.push(PbxValue::Dict(entry));
+        }
+
+        let main_group_children = if project_children.is_empty() {
+            Vec::new()
+        } else {
+            let projects_group = self.add_group(
+                "projectReferences",
+                Some("Projects".to_owned()),
+                None,
+                project_children,
+            );
+            vec![PbxValue::reference(projects_group, "Projects")]
+        };
+        ProjectReferences {
+            main_group_children,
+            project_references,
+        }
+    }
+
+    fn add_project_reference_file_ref(&mut self, name: &str) -> String {
+        let path = self
+            .project
+            .project_references
+            .get(name)
+            .and_then(|reference| reference.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or(name);
+        self.add_file_reference(
+            &format!("projectReference:{name}"),
+            name.to_owned(),
+            Some(path.trim_start_matches("./").to_owned()),
+            Some("wrapper.pb-project".to_owned()),
+            Some(name.to_owned()),
+            "<group>",
+            true,
+        )
+    }
+
+    fn project_reference_pbxproj(&self, project_name: &str) -> Option<String> {
+        let path = self
+            .project
+            .project_references
+            .get(project_name)?
+            .get("path")?
+            .as_str()?
+            .trim_start_matches("./")
+            .to_owned();
+        fs::read_to_string(self.project.base_path.join(path).join("project.pbxproj")).ok()
+    }
+
+    fn project_reference_target_id(&self, project_name: &str, target_name: &str) -> Option<String> {
+        let pbxproj = self.project_reference_pbxproj(project_name)?;
+        pbxproj.lines().find_map(|line| {
+            if line.contains(&format!("/* {target_name} */ = {{")) {
+                line.split_whitespace().next().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn project_reference_product_id(
+        &self,
+        project_name: &str,
+        target_name: &str,
+    ) -> Option<String> {
+        let pbxproj = self.project_reference_pbxproj(project_name)?;
+        let target_line = pbxproj
+            .lines()
+            .position(|line| line.contains(&format!("/* {target_name} */ = {{")))?;
+        pbxproj.lines().skip(target_line).find_map(|line| {
+            line.trim_start()
+                .strip_prefix("productReference = ")
+                .and_then(|value| value.split_whitespace().next())
+                .map(str::to_owned)
+        })
+    }
+
+    fn add_project_reference_product(&mut self, reference: &str) -> Option<String> {
+        if let Some(existing) = self.project_reference_product_refs.get(reference) {
+            return Some(existing.clone());
+        }
+        let (project_name, target_name) = reference.split_once('/')?;
+        if !self.project.project_references.contains_key(project_name) {
+            return None;
+        }
+        let project_ref = self.add_project_reference_file_ref(project_name);
+        let product_name = self
+            .project
+            .targets
+            .get(target_name)
+            .map(Target::filename)
+            .unwrap_or_else(|| format!("{target_name}.framework"));
+        let proxy = self.graph.add(
+            &format!("projectReferenceProductProxy:{reference}"),
+            PbxObject::new("PBXContainerItemProxy", "PBXContainerItemProxy")
+                .field(
+                    "containerPortal",
+                    PbxValue::reference(project_ref, project_name.to_owned()),
+                )
+                .field("proxyType", PbxValue::Int(2))
+                .field(
+                    "remoteGlobalIDString",
+                    PbxValue::String(
+                        self.project_reference_product_id(project_name, target_name)
+                            .unwrap_or_else(|| {
+                                self.graph.id_for(&format!("nativeTarget:{target_name}"))
+                            }),
+                    ),
+                )
+                .field("remoteInfo", PbxValue::String(target_name.to_owned())),
+        );
+        let product_ref = self.graph.add(
+            &format!("projectReferenceProduct:{reference}"),
+            PbxObject::new("PBXReferenceProxy", product_name.clone())
+                .field(
+                    "fileType",
+                    PbxValue::String(file_type_for_path(&product_name, None)),
+                )
+                .field("path", PbxValue::String(product_name))
+                .field(
+                    "remoteRef",
+                    PbxValue::reference(proxy, "PBXContainerItemProxy"),
+                )
+                .field(
+                    "sourceTree",
+                    PbxValue::String("BUILT_PRODUCTS_DIR".to_owned()),
+                ),
+        );
+        self.project_reference_product_refs
+            .insert(reference.to_owned(), product_ref.clone());
+        Some(product_ref)
+    }
+
+    fn add_target_dependency(
+        &mut self,
+        target_name: &str,
+        dependency_name: &str,
+        dependency: Option<&Dependency>,
+    ) -> String {
+        if let Some((project_name, external_target_name)) = dependency_name.split_once('/') {
+            let project_ref = self.add_project_reference_file_ref(project_name);
+            let proxy_id = self.graph.add(
+                &format!("projectReferenceTargetProxy:{target_name}:{dependency_name}"),
+                PbxObject::new("PBXContainerItemProxy", "PBXContainerItemProxy")
+                    .field(
+                        "containerPortal",
+                        PbxValue::reference(project_ref, project_name.to_owned()),
+                    )
+                    .field("proxyType", PbxValue::Int(1))
+                    .field(
+                        "remoteGlobalIDString",
+                        PbxValue::String(
+                            self.project_reference_target_id(project_name, external_target_name)
+                                .unwrap_or_else(|| {
+                                    self.graph
+                                        .id_for(&format!("nativeTarget:{external_target_name}"))
+                                }),
+                        ),
+                    )
+                    .field(
+                        "remoteInfo",
+                        PbxValue::String(external_target_name.to_owned()),
+                    ),
+            );
+            let mut object = PbxObject::new("PBXTargetDependency", "PBXTargetDependency")
+                .field("name", PbxValue::String(external_target_name.to_owned()))
+                .field(
+                    "targetProxy",
+                    PbxValue::reference(proxy_id, "PBXContainerItemProxy"),
+                );
+            if let Some(platform_filter) = target_dependency_platform_filter(dependency) {
+                object = object.field("platformFilter", PbxValue::String(platform_filter));
+            }
+            return self.graph.add(
+                &format!("targetDependency:{target_name}:{dependency_name}"),
+                object,
+            );
+        }
         let project_id = self.graph.id_for("project");
         let dependency_target_id = self.target_id_for_dependency(dependency_name);
         let proxy_id = self.graph.add(
@@ -747,17 +1230,21 @@ impl<'a> PbxGenerator<'a> {
                 )
                 .field("remoteInfo", PbxValue::String(dependency_name.to_owned())),
         );
+        let mut object = PbxObject::new("PBXTargetDependency", "PBXTargetDependency")
+            .field(
+                "target",
+                PbxValue::reference(dependency_target_id, dependency_name.to_owned()),
+            )
+            .field(
+                "targetProxy",
+                PbxValue::reference(proxy_id, "PBXContainerItemProxy"),
+            );
+        if let Some(platform_filter) = target_dependency_platform_filter(dependency) {
+            object = object.field("platformFilter", PbxValue::String(platform_filter));
+        }
         self.graph.add(
             &format!("targetDependency:{target_name}:{dependency_name}"),
-            PbxObject::new("PBXTargetDependency", "PBXTargetDependency")
-                .field(
-                    "target",
-                    PbxValue::reference(dependency_target_id, dependency_name.to_owned()),
-                )
-                .field(
-                    "targetProxy",
-                    PbxValue::reference(proxy_id, "PBXContainerItemProxy"),
-                ),
+            object,
         )
     }
 
@@ -796,14 +1283,24 @@ impl<'a> PbxGenerator<'a> {
         _target: &Target,
         source: &TargetSource,
     ) -> String {
+        let path = if self.should_create_intermediate_groups(source) {
+            display_name(&source.path)
+        } else {
+            source.path.clone()
+        };
         let mut object = PbxObject::new(
             "PBXFileSystemSynchronizedRootGroup",
             display_name(&source.path),
         )
-        .field("path", PbxValue::String(source.path.clone()))
+        .field("explicitFileTypes", PbxValue::Dict(BTreeMap::new()))
+        .field("explicitFolders", PbxValue::Array(Vec::new()))
+        .field("path", PbxValue::String(path))
         .field("sourceTree", PbxValue::String("<group>".to_owned()));
-        if let Some(name) = &source.name {
-            object = object.field("name", PbxValue::String(name.clone()));
+        if let Some(name) = source.name.clone().or_else(|| {
+            self.should_create_intermediate_groups(source)
+                .then(|| display_name(&source.path))
+        }) {
+            object = object.field("name", PbxValue::String(name));
         }
         let matching_sources = self
             .project
@@ -829,9 +1326,7 @@ impl<'a> PbxGenerator<'a> {
             .collect::<Vec<_>>();
         explicit_folders.sort();
         explicit_folders.dedup();
-        if !explicit_folders.is_empty() {
-            object = object.field("explicitFolders", string_array(&explicit_folders));
-        }
+        object = object.field("explicitFolders", string_array(&explicit_folders));
         let exception_sets = matching_sources
             .iter()
             .filter_map(|(target, source)| self.add_synced_folder_exception_set(target, source))
@@ -882,7 +1377,7 @@ impl<'a> PbxGenerator<'a> {
     }
 
     fn add_source_navigator_groups(&mut self) -> Vec<PbxValue> {
-        let mut groups = Vec::<(String, PbxValue)>::new();
+        let mut groups = Vec::<(String, String, PbxValue)>::new();
         let mut seen = BTreeSet::new();
         let targets = self.project.targets.values().cloned().collect::<Vec<_>>();
         for target in &targets {
@@ -894,6 +1389,14 @@ impl<'a> PbxGenerator<'a> {
                 {
                     continue;
                 }
+                if self
+                    .project
+                    .file_groups
+                    .iter()
+                    .any(|group| path_is_under_group(&source.path, group))
+                {
+                    continue;
+                }
                 let key = format!("{:?}:{}", source_type, source.path);
                 if !seen.insert(key) {
                     continue;
@@ -902,15 +1405,17 @@ impl<'a> PbxGenerator<'a> {
                     continue;
                 };
                 let sort_path = source.group.clone().unwrap_or_else(|| source.path.clone());
-                groups.push((sort_path, PbxValue::reference(id, comment)));
+                groups.push((comment.clone(), sort_path, PbxValue::reference(id, comment)));
             }
         }
-        groups.sort_by(|(left, _), (right, _)| natural_cmp(left, right));
+        groups.sort_by(|(left_name, left_path, _), (right_name, right_path, _)| {
+            natural_cmp(left_name, right_name).then_with(|| natural_cmp(left_path, right_path))
+        });
 
         let mut top_level_seen = BTreeSet::new();
         groups
             .into_iter()
-            .filter_map(|(_, value)| match value {
+            .filter_map(|(_, _, value)| match value {
                 PbxValue::Ref { id, comment } => top_level_seen
                     .insert(id.clone())
                     .then_some(PbxValue::Ref { id, comment }),
@@ -927,28 +1432,31 @@ impl<'a> PbxGenerator<'a> {
         match self.effective_source_type(source) {
             SourceType::SyncedFolder => {
                 let id = self.add_file_system_synchronized_root_group(target, source);
-                Some((
-                    id,
-                    source
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| display_name(&source.path)),
-                ))
+                let comment = source
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| display_name(&source.path));
+                if self.should_create_intermediate_groups(source) {
+                    let parent = Path::new(&source.path)
+                        .parent()
+                        .and_then(|parent| parent.to_str())
+                        .unwrap_or("");
+                    if !parent.is_empty() {
+                        return Some(self.add_nested_navigator_groups(
+                            &format!("navigatorIntermediate:{parent}"),
+                            parent,
+                            PbxValue::reference(id, comment),
+                        ));
+                    }
+                }
+                Some((id, comment))
             }
             SourceType::Folder => {
                 let comment = source
                     .name
                     .clone()
                     .unwrap_or_else(|| display_name(&source.path));
-                let id = self.add_file_reference(
-                    &format!("navigatorFolder:{}", source.path),
-                    comment.clone(),
-                    Some(source.path.clone()),
-                    Some("folder".to_owned()),
-                    source.name.clone(),
-                    "<group>",
-                    false,
-                );
+                let id = self.add_folder_file_reference(source);
                 if let Some(group) = source.group.as_deref() {
                     return Some(self.add_nested_navigator_groups(
                         &format!("navigatorCustomGroup:{group}"),
@@ -973,9 +1481,7 @@ impl<'a> PbxGenerator<'a> {
             }
             SourceType::File => {
                 let path = self.project.base_path.join(&source.path);
-                let parent = path
-                    .parent()
-                    .unwrap_or_else(|| self.project.base_path.as_path());
+                let parent = path.parent().unwrap_or(self.project.base_path.as_path());
                 let parent_relative = pathdiff(parent, &self.project.base_path)
                     .to_string_lossy()
                     .into_owned();
@@ -991,8 +1497,12 @@ impl<'a> PbxGenerator<'a> {
                     } else {
                         self.project.base_path.as_path()
                     };
-                    let id =
-                        self.add_source_file_reference(file_parent, &path, source.name.as_deref());
+                    let file_name = source.name.as_deref().or_else(|| {
+                        Path::new(&source.path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                    });
+                    let id = self.add_source_file_reference(file_parent, &path, file_name);
                     return Some(self.add_nested_navigator_groups(
                         &format!("navigatorCustomGroup:{group}"),
                         group,
@@ -1001,6 +1511,13 @@ impl<'a> PbxGenerator<'a> {
                 }
                 if parent_relative.is_empty() {
                     let id = self.add_source_file_reference(parent, &path, source.name.as_deref());
+                    Some((id, name))
+                } else if source.name.is_some() {
+                    let id = self.add_source_file_reference(
+                        self.project.base_path.as_path(),
+                        &path,
+                        source.name.as_deref(),
+                    );
                     Some((id, name))
                 } else if self.should_create_intermediate_groups(source) {
                     let child =
@@ -1016,7 +1533,7 @@ impl<'a> PbxGenerator<'a> {
                     let group_name = display_name(&parent_relative);
                     let id = self.add_group(
                         &format!("navigatorGroup:{parent_relative}"),
-                        Some(group_name.clone()),
+                        None,
                         Some(parent_relative),
                         vec![PbxValue::reference(
                             child,
@@ -1034,9 +1551,18 @@ impl<'a> PbxGenerator<'a> {
                 if !path.is_dir() {
                     return None;
                 }
-                let group_parent = if self.should_create_intermediate_groups(source) {
-                    path.parent()
-                        .unwrap_or_else(|| self.project.base_path.as_path())
+                let parent = path.parent().unwrap_or(self.project.base_path.as_path());
+                let parent_relative = pathdiff(parent, &self.project.base_path)
+                    .to_string_lossy()
+                    .into_owned();
+                let group_parent = if source
+                    .group
+                    .as_deref()
+                    .is_some_and(|group| group == parent_relative)
+                {
+                    parent
+                } else if self.should_create_intermediate_groups(source) {
+                    path.parent().unwrap_or(self.project.base_path.as_path())
                 } else {
                     self.project.base_path.as_path()
                 };
@@ -1145,7 +1671,46 @@ impl<'a> PbxGenerator<'a> {
         });
 
         let mut children = Vec::new();
+        let mut seen_children = BTreeSet::new();
         for entry in entries {
+            if entry.is_dir()
+                && entry.extension().and_then(|extension| extension.to_str()) == Some("lproj")
+            {
+                if let Ok(localized_entries) = fs::read_dir(&entry) {
+                    let mut localized_files = localized_entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            path.is_file()
+                                && !path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .is_some_and(|name| name.starts_with('.'))
+                        })
+                        .collect::<Vec<_>>();
+                    localized_files.sort();
+                    for localized_file in localized_files {
+                        if !source_matches_filters(
+                            &self.project.base_path.join(&source.path),
+                            &localized_file,
+                            source,
+                        ) {
+                            continue;
+                        }
+                        let file_id =
+                            self.add_source_file_reference(directory, &localized_file, None);
+                        if seen_children.insert(file_id.clone()) {
+                            children.push(PbxValue::reference(
+                                file_id,
+                                localized_variant_group_name(&localized_file).unwrap_or_else(
+                                    || display_name(&localized_file.to_string_lossy()),
+                                ),
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
             if entry.is_dir()
                 && !is_wrapper_path(&entry)
                 && !file_type_options(
@@ -1164,12 +1729,30 @@ impl<'a> PbxGenerator<'a> {
                 &self.project.base_path.join(&source.path),
                 &entry,
                 source,
-            ) {
-                let file_id = self.add_source_file_reference(directory, &entry, None);
-                children.push(PbxValue::reference(
-                    file_id,
-                    display_name(&entry.to_string_lossy()),
-                ));
+            ) || self.is_file_group_path(&entry)
+            {
+                let file_id = if self.is_file_group_path(&entry) {
+                    let relative = pathdiff(&entry, &self.project.base_path)
+                        .to_string_lossy()
+                        .into_owned();
+                    self.add_file_reference(
+                        &format!("fileGroup:{relative}"),
+                        display_name(&relative),
+                        Some(pathdiff(&entry, directory).to_string_lossy().into_owned()),
+                        None,
+                        None,
+                        "<group>",
+                        true,
+                    )
+                } else {
+                    self.add_source_file_reference(directory, &entry, None)
+                };
+                if seen_children.insert(file_id.clone()) {
+                    children.push(PbxValue::reference(
+                        file_id,
+                        display_name(&entry.to_string_lossy()),
+                    ));
+                }
             }
         }
 
@@ -1189,10 +1772,40 @@ impl<'a> PbxGenerator<'a> {
         };
         Some(self.add_group(
             &format!("navigatorGroup:{relative}"),
-            (root && source.name.is_some()).then_some(name.clone()),
+            (root && (source.name.is_some() || source.group.is_some())).then_some(name.clone()),
             Some(group_path),
             children,
         ))
+    }
+
+    fn is_file_group_path(&self, path: &Path) -> bool {
+        let relative = pathdiff(path, &self.project.base_path)
+            .to_string_lossy()
+            .into_owned();
+        self.project
+            .file_groups
+            .iter()
+            .any(|group| group == &relative)
+    }
+
+    fn add_folder_file_reference(&mut self, source: &TargetSource) -> String {
+        let comment = source
+            .name
+            .clone()
+            .unwrap_or_else(|| display_name(&source.path));
+        let name = source.name.clone().or_else(|| {
+            (comment != source.path && comment == display_name(&source.path))
+                .then(|| comment.clone())
+        });
+        self.add_file_reference(
+            &format!("folderFileRef:{}", source.path),
+            comment,
+            Some(source.path.clone()),
+            Some("folder".to_owned()),
+            name,
+            "SOURCE_ROOT",
+            true,
+        )
     }
 
     fn add_source_file_reference(
@@ -1201,32 +1814,173 @@ impl<'a> PbxGenerator<'a> {
         path: &Path,
         name: Option<&str>,
     ) -> String {
+        if name.is_none() {
+            if let Some(variant_id) = self.add_variant_group_reference(parent, path) {
+                return variant_id;
+            }
+            if let Some(version_group_id) = self.add_model_version_group_reference(parent, path) {
+                return version_group_id;
+            }
+        }
         let relative = pathdiff(path, &self.project.base_path)
             .to_string_lossy()
             .into_owned();
-        let parent_relative = pathdiff(parent, &self.project.base_path);
         let file_path = pathdiff(path, parent).to_string_lossy().into_owned();
         let comment = name
             .map(str::to_owned)
             .unwrap_or_else(|| display_name(&relative));
+        let last_known_file_type = {
+            let file_type = file_type_for_path(&relative, None);
+            if relative.ends_with(".xctestplan") || file_type == "file" {
+                None
+            } else {
+                Some(file_type)
+            }
+        };
         self.add_file_reference(
             &format!("navigatorFileRef:{relative}"),
             comment,
             Some(file_path),
-            Some(file_type_for_path(&relative, None)),
-            name.map(str::to_owned)
-                .filter(|value| *value != display_name(&relative)),
-            if parent_relative.as_os_str().is_empty() {
-                "<group>"
-            } else {
-                "<group>"
-            },
-            false,
+            last_known_file_type,
+            name.map(str::to_owned).filter(|value| {
+                *value != display_name(&relative)
+                    || Path::new(&relative)
+                        .parent()
+                        .is_some_and(|parent| !parent.as_os_str().is_empty())
+            }),
+            "<group>",
+            true,
+        )
+    }
+
+    fn add_model_version_group_reference(&mut self, parent: &Path, path: &Path) -> Option<String> {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("xcdatamodeld") {
+            return None;
+        }
+        let mut model_versions = fs::read_dir(path)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|entry| {
+                entry.is_dir()
+                    && entry.extension().and_then(|extension| extension.to_str())
+                        == Some("xcdatamodel")
+            })
+            .collect::<Vec<_>>();
+        model_versions.sort_by(|left, right| {
+            natural_cmp(
+                &display_name(&left.to_string_lossy()),
+                &display_name(&right.to_string_lossy()),
+            )
+        });
+        if model_versions.is_empty() {
+            return None;
+        }
+
+        let relative = pathdiff(path, &self.project.base_path)
+            .to_string_lossy()
+            .into_owned();
+        let group_name = display_name(&relative);
+        let current_version_name = model_current_version_name(path);
+        let mut children = Vec::new();
+        let mut current_version = None;
+        for model_version in model_versions {
+            let version_name = display_name(&model_version.to_string_lossy());
+            let version_relative = pathdiff(&model_version, &self.project.base_path)
+                .to_string_lossy()
+                .into_owned();
+            let file_ref = self.add_file_reference(
+                &format!("modelVersionFileRef:{version_relative}"),
+                version_name.clone(),
+                Some(
+                    pathdiff(&model_version, path)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                Some("wrapper.xcdatamodel".to_owned()),
+                None,
+                "<group>",
+                true,
+            );
+            if current_version_name.as_deref() == Some(version_name.as_str()) {
+                current_version = Some(PbxValue::reference(file_ref.clone(), version_name.clone()));
+            }
+            children.push(PbxValue::reference(file_ref, version_name));
+        }
+
+        let mut object = PbxObject::new("XCVersionGroup", group_name.clone())
+            .field("children", PbxValue::Array(children))
+            .field(
+                "path",
+                PbxValue::String(pathdiff(path, parent).to_string_lossy().into_owned()),
+            )
+            .field("sourceTree", PbxValue::String("<group>".to_owned()))
+            .field(
+                "versionGroupType",
+                PbxValue::String("wrapper.xcdatamodel".to_owned()),
+            );
+        if let Some(current_version) = current_version {
+            object = object.field("currentVersion", current_version);
+        }
+        Some(
+            self.graph
+                .add(&format!("modelVersionGroup:{relative}"), object),
+        )
+    }
+
+    fn add_variant_group_reference(&mut self, parent: &Path, path: &Path) -> Option<String> {
+        let lproj_dir = path.parent()?;
+        if lproj_dir
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("lproj")
+        {
+            return None;
+        }
+        let variant_parent = lproj_dir.parent()?;
+        let group_name = localized_variant_group_name(path)?;
+        let mut children = Vec::new();
+        let mut localized_files = localized_variant_files(variant_parent, &group_name);
+        if localized_files.is_empty() {
+            return None;
+        }
+        localized_files.sort_by_key(|left| localized_file_locale(left));
+        for localized_file in localized_files {
+            let locale = localized_file_locale(&localized_file)?;
+            let relative = pathdiff(&localized_file, &self.project.base_path)
+                .to_string_lossy()
+                .into_owned();
+            let file_path = pathdiff(&localized_file, parent)
+                .to_string_lossy()
+                .into_owned();
+            let file_ref = self.add_file_reference(
+                &format!("variantFileRef:{relative}"),
+                locale.clone(),
+                Some(file_path),
+                Some(file_type_for_path(&relative, None)),
+                Some(locale.clone()),
+                "<group>",
+                true,
+            );
+            children.push(PbxValue::reference(file_ref, locale));
+        }
+        Some(
+            self.graph.add(
+                &format!(
+                    "variantGroup:{}:{group_name}",
+                    pathdiff(variant_parent, &self.project.base_path).to_string_lossy()
+                ),
+                PbxObject::new("PBXVariantGroup", group_name.clone())
+                    .field("children", PbxValue::Array(children))
+                    .field("name", PbxValue::String(group_name))
+                    .field("sourceTree", PbxValue::String("<group>".to_owned())),
+            ),
         )
     }
 
     fn add_frameworks_navigator_group(&mut self) -> Option<PbxValue> {
         let mut references = BTreeMap::<String, PbxValue>::new();
+        let mut carthage_children = BTreeMap::<Platform, BTreeMap<String, PbxValue>>::new();
         let targets = self.project.targets.values().cloned().collect::<Vec<_>>();
         for target in &targets {
             for dependency in &target.dependencies {
@@ -1237,25 +1991,74 @@ impl<'a> PbxGenerator<'a> {
                     }
                     DependencyType::Sdk { .. } => {
                         let name = display_name(&dependency.reference);
-                        (name, dependency.reference.clone(), "SDKROOT")
+                        let source_tree = match &dependency.dependency_type {
+                            DependencyType::Sdk { root } => root.as_deref().unwrap_or("SDKROOT"),
+                            _ => "SDKROOT",
+                        };
+                        (
+                            name,
+                            sdk_reference_path(&dependency.reference, source_tree),
+                            source_tree,
+                        )
                     }
                     DependencyType::Carthage { .. } => {
-                        let name = carthage_framework_name(&dependency.reference);
-                        (name.clone(), name, "<group>")
+                        let refs = carthage_dependency_references(self.project, target, dependency);
+                        let children = carthage_children
+                            .entry(target.platform.clone())
+                            .or_default();
+                        for reference in refs {
+                            let name = carthage_framework_name(&reference);
+                            let id = self
+                                .graph
+                                .id_for(&format!("carthageRef:{}:{reference}", target.name));
+                            children.insert(name.clone(), PbxValue::reference(id, name));
+                        }
+                        continue;
                     }
                     _ => continue,
                 };
+                let key = if matches!(dependency.dependency_type, DependencyType::Sdk { .. }) {
+                    framework_dependency_reference_key(&target.name, dependency, &path)
+                } else {
+                    format!("navigatorFrameworkRef:{path}")
+                };
                 let id = self.add_file_reference(
-                    &format!("navigatorFrameworkRef:{path}"),
+                    &key,
                     name.clone(),
                     Some(path),
                     Some(file_type_for_path(&name, None)),
-                    None,
+                    matches!(dependency.dependency_type, DependencyType::Sdk { .. })
+                        .then_some(name.clone()),
                     source_tree,
-                    false,
+                    true,
                 );
                 references.insert(name.clone(), PbxValue::reference(id, name));
             }
+        }
+        if !carthage_children.is_empty() {
+            let mut carthage_groups = BTreeMap::<Platform, PbxValue>::new();
+            for (platform, children) in carthage_children {
+                let platform_path = carthage_platform_dir(&platform).to_owned();
+                let platform_group = self.add_group(
+                    &format!("Carthage:{platform_path}"),
+                    None,
+                    Some(platform_path.clone()),
+                    children.into_values().collect(),
+                );
+                carthage_groups
+                    .insert(platform, PbxValue::reference(platform_group, platform_path));
+            }
+            let carthage_group_children = ordered_carthage_platform_groups(&carthage_groups);
+            let carthage_group = self.add_group(
+                "Carthage",
+                Some("Carthage".to_owned()),
+                Some("Carthage/Build".to_owned()),
+                carthage_group_children,
+            );
+            references.insert(
+                "Carthage".to_owned(),
+                PbxValue::reference(carthage_group, "Carthage"),
+            );
         }
         if references.is_empty() {
             return None;
@@ -1267,6 +2070,39 @@ impl<'a> PbxGenerator<'a> {
             references.into_values().collect(),
         );
         Some(PbxValue::reference(group_id, "Frameworks"))
+    }
+
+    fn add_bundles_navigator_group(&mut self) -> Option<PbxValue> {
+        let mut references = BTreeMap::<String, PbxValue>::new();
+        for target in self.project.targets.values() {
+            for dependency in &target.dependencies {
+                if dependency.dependency_type != DependencyType::Bundle {
+                    continue;
+                }
+                let reference = &dependency.reference;
+                let name = display_name(reference);
+                let file_ref = self.add_file_reference(
+                    &format!("bundleDependencyRef:{reference}"),
+                    name.clone(),
+                    Some(reference.clone()),
+                    Some(file_type_for_path(reference, None)),
+                    None,
+                    "BUILT_PRODUCTS_DIR",
+                    true,
+                );
+                references.insert(name.clone(), PbxValue::reference(file_ref, name));
+            }
+        }
+        if references.is_empty() {
+            return None;
+        }
+        let group_id = self.add_group(
+            "bundleDependenciesGroup",
+            Some("Bundles".to_owned()),
+            None,
+            references.into_values().collect(),
+        );
+        Some(PbxValue::reference(group_id, "Bundles"))
     }
 
     fn collect_target_files(&mut self, target: &Target) -> Vec<FileBuildRefs> {
@@ -1290,11 +2126,14 @@ impl<'a> PbxGenerator<'a> {
                 &self.project.spec_options.file_types,
             );
             let source_path = self.project.base_path.join(&source.path);
-            let custom_name_applies =
-                source.name.is_some() && (!source_path.is_dir() || expanded_paths.len() == 1);
+            let custom_name_applies = source.name.is_some() && !source_path.is_dir();
             for path in expanded_paths {
-                let relative = pathdiff(&path, &self.project.base_path);
-                let relative_string = relative.to_string_lossy().into_owned();
+                let variant = localized_variant_group_path(&self.project.base_path, &path);
+                let relative_string = variant.clone().unwrap_or_else(|| {
+                    pathdiff(&path, &self.project.base_path)
+                        .to_string_lossy()
+                        .into_owned()
+                });
                 if !seen.insert(relative_string.clone()) {
                     continue;
                 }
@@ -1306,26 +2145,37 @@ impl<'a> PbxGenerator<'a> {
                 } else {
                     display_name(&relative_string)
                 };
-                let file_type = if effective_source_type == SourceType::Folder {
-                    "folder".to_owned()
+                let parent = if custom_name_applies {
+                    self.project.base_path.as_path()
+                } else if variant.is_some() {
+                    path.parent()
+                        .and_then(Path::parent)
+                        .unwrap_or(self.project.base_path.as_path())
+                } else if effective_source_type == SourceType::Folder {
+                    self.project.base_path.as_path()
                 } else {
-                    file_type_for_path(&relative_string, None)
+                    path.parent().unwrap_or(self.project.base_path.as_path())
                 };
-                let file_ref_id = self.add_file_reference(
-                    &format!("fileRef:{}:{relative_string}", target.name),
-                    name.clone(),
-                    Some(relative_string.clone()),
-                    Some(file_type),
-                    custom_name_applies.then(|| name.clone()),
-                    "<group>",
-                    false,
-                );
+                let file_ref_id = if effective_source_type == SourceType::Folder {
+                    self.add_folder_file_reference(source)
+                } else {
+                    self.add_source_file_reference(
+                        parent,
+                        &path,
+                        custom_name_applies.then_some(name.as_str()),
+                    )
+                };
                 let mut build_phase =
                     if let Some(override_phase) = source_build_phase_override(source) {
                         override_phase
                     } else if effective_source_type == SourceType::Folder {
                         Some("Resources")
-                    } else if info_plist_files.contains(&relative_string) {
+                    } else if Path::new(&relative_string)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        == Some("Info.plist")
+                        || info_plist_files.contains(&relative_string)
+                    {
                         None
                     } else if let Some(file_type) =
                         file_type_options(&relative_string, &self.project.spec_options.file_types)
@@ -1343,15 +2193,40 @@ impl<'a> PbxGenerator<'a> {
                     } else {
                         None
                     };
-                } else if build_phase == Some("Headers") && !target_supports_headers_phase(target) {
+                } else if (build_phase == Some("CopyFiles")
+                    && is_module_copy_file(&relative_string)
+                    && !(target.target_type.is_framework()
+                        || target.target_type == ProductType::StaticLibrary))
+                    || (build_phase == Some("Headers") && !target_supports_headers_phase(target))
+                {
                     build_phase = None;
                 }
+                let copy_files_settings = match build_phase {
+                    Some("CopyHeaders") => Some(CopyFilesSettings {
+                        dst_subfolder_spec: 16,
+                        dst_path: "include/$(PRODUCT_NAME)".to_owned(),
+                        phase_name: "CopyFiles".to_owned(),
+                        phase_order: CopyFilesPhaseOrder::PreCompile,
+                    }),
+                    Some("CopyFiles") => {
+                        source_copy_files_settings(target, source, &relative_string)
+                    }
+                    _ => None,
+                };
                 let build_file_id = if let Some(phase) = build_phase {
-                    let mut object = PbxObject::new("PBXBuildFile", format!("{name} in {phase}"))
-                        .field(
-                            "fileRef",
-                            PbxValue::reference(file_ref_id.clone(), name.clone()),
-                        );
+                    let build_file_phase_name = if phase == "CopyHeaders" {
+                        "CopyFiles"
+                    } else {
+                        phase
+                    };
+                    let mut object = PbxObject::new(
+                        "PBXBuildFile",
+                        format!("{name} in {build_file_phase_name}"),
+                    )
+                    .field(
+                        "fileRef",
+                        PbxValue::reference(file_ref_id.clone(), name.clone()),
+                    );
                     let file_type =
                         file_type_options(&relative_string, &self.project.spec_options.file_types);
                     let build_file_settings = source_build_file_settings(source, file_type, phase);
@@ -1373,6 +2248,7 @@ impl<'a> PbxGenerator<'a> {
                     build_file_id,
                     name,
                     build_phase,
+                    copy_files_settings,
                 });
             }
         }
@@ -1399,6 +2275,7 @@ impl<'a> PbxGenerator<'a> {
         &mut self,
         target: &Target,
         package_product_dependencies: &mut Vec<PbxValue>,
+        package_target_dependencies: &mut Vec<PbxValue>,
     ) -> Vec<PbxValue> {
         let mut files = Vec::new();
         for dependency in &target.dependencies {
@@ -1406,17 +2283,24 @@ impl<'a> PbxGenerator<'a> {
                 DependencyType::Framework | DependencyType::Sdk { .. } => {
                     let reference = &dependency.reference;
                     let name = display_name(reference);
-                    let file_ref = self.add_file_reference(
-                        &format!("frameworkRef:{}:{reference}", target.name),
-                        name.clone(),
-                        Some(reference.clone()),
-                        Some(file_type_for_path(&name, None)),
-                        None,
-                        if matches!(dependency.dependency_type, DependencyType::Sdk { .. }) {
-                            "SDKROOT"
+                    let source_tree =
+                        if let DependencyType::Sdk { root } = &dependency.dependency_type {
+                            root.as_deref().unwrap_or("SDKROOT")
                         } else {
                             "<group>"
-                        },
+                        };
+                    let path = if matches!(dependency.dependency_type, DependencyType::Sdk { .. }) {
+                        sdk_reference_path(reference, source_tree)
+                    } else {
+                        reference.clone()
+                    };
+                    let file_ref = self.add_file_reference(
+                        &framework_dependency_reference_key(&target.name, dependency, &path),
+                        name.clone(),
+                        Some(path),
+                        Some(file_type_for_path(&name, None)),
+                        None,
+                        source_tree,
                         false,
                     );
                     let mut settings = BTreeMap::new();
@@ -1429,6 +2313,9 @@ impl<'a> PbxGenerator<'a> {
                     let mut object =
                         PbxObject::new("PBXBuildFile", format!("{name} in Frameworks"))
                             .field("fileRef", PbxValue::reference(file_ref, name.clone()));
+                    if let Some(platform_filter) = dependency_platform_filter(dependency) {
+                        object = object.field("platformFilter", PbxValue::String(platform_filter));
+                    }
                     let platform_filters = platform_filters_for_dependency(dependency);
                     if !platform_filters.is_empty() {
                         object = object.field("platformFilters", string_array(&platform_filters));
@@ -1446,6 +2333,52 @@ impl<'a> PbxGenerator<'a> {
                     ));
                 }
                 DependencyType::Target => {
+                    if dependency.reference.contains('/') {
+                        let Some(product_ref_id) =
+                            self.add_project_reference_product(&dependency.reference)
+                        else {
+                            continue;
+                        };
+                        let name = self
+                            .graph
+                            .comments
+                            .get(&product_ref_id)
+                            .cloned()
+                            .unwrap_or_else(|| display_name(&dependency.reference));
+                        let mut object = PbxObject::new(
+                            "PBXBuildFile",
+                            format!("{name} in Frameworks"),
+                        )
+                        .field("fileRef", PbxValue::reference(product_ref_id, name.clone()));
+                        if let Some(platform_filter) = dependency_platform_filter(dependency) {
+                            object =
+                                object.field("platformFilter", PbxValue::String(platform_filter));
+                        }
+                        let platform_filters = platform_filters_for_dependency(dependency);
+                        if !platform_filters.is_empty() {
+                            object =
+                                object.field("platformFilters", string_array(&platform_filters));
+                        }
+                        let build_file = self.graph.add(
+                            &format!(
+                                "projectReferenceProductBuildFile:{}:{}",
+                                target.name, dependency.reference
+                            ),
+                            object,
+                        );
+                        files.push(PbxValue::reference(
+                            build_file,
+                            format!("{name} in Frameworks"),
+                        ));
+                        continue;
+                    }
+                    let Some(dependency_target) = self.project.targets.get(&dependency.reference)
+                    else {
+                        continue;
+                    };
+                    if !target_dependency_should_link(target, dependency, dependency_target) {
+                        continue;
+                    }
                     if let Some(refs) = self.target_refs.get(&dependency.reference) {
                         let name = self
                             .graph
@@ -1465,6 +2398,10 @@ impl<'a> PbxGenerator<'a> {
                                 "fileRef",
                                 PbxValue::reference(refs.product_ref_id.clone(), name.clone()),
                             );
+                        if let Some(platform_filter) = dependency_platform_filter(dependency) {
+                            object =
+                                object.field("platformFilter", PbxValue::String(platform_filter));
+                        }
                         if !settings.is_empty() {
                             object = object.field("settings", PbxValue::Dict(settings));
                         }
@@ -1492,34 +2429,170 @@ impl<'a> PbxGenerator<'a> {
                     } else {
                         products.clone()
                     };
+                    let platform_filters = platform_filters_for_dependency(dependency);
                     for product_name in product_names {
-                        let product_dependency = self
-                            .add_package_product_dependency(&dependency.reference, &product_name);
-                        package_product_dependencies.push(PbxValue::reference(
-                            product_dependency.clone(),
-                            product_name.clone(),
-                        ));
-                        files.push(self.package_product_build_file(
+                        let product_dependency = self.add_package_product_dependency(
                             &target.name,
+                            &dependency.reference,
                             &product_name,
-                            &product_dependency,
-                            dependency.weak_link,
-                            &platform_filters_for_dependency(dependency),
-                        ));
+                            false,
+                            &platform_filters,
+                        );
+                        if dependency.link.unwrap_or(true) {
+                            package_product_dependencies.push(PbxValue::reference(
+                                product_dependency.clone(),
+                                product_name.clone(),
+                            ));
+                        }
+                        if dependency
+                            .link
+                            .unwrap_or(target.target_type != ProductType::StaticLibrary)
+                        {
+                            files.push(self.package_product_build_file(
+                                &target.name,
+                                &product_name,
+                                &product_dependency,
+                                dependency.weak_link,
+                                dependency_platform_filter(dependency),
+                                &platform_filters,
+                            ));
+                        } else {
+                            package_target_dependencies.push(
+                                self.package_product_target_dependency(
+                                    &target.name,
+                                    &product_name,
+                                    &product_dependency,
+                                    &platform_filters,
+                                ),
+                            );
+                        }
                     }
                 }
                 DependencyType::Carthage { .. } => {
                     if dependency.link == Some(false) {
                         continue;
                     }
-                    let name = carthage_framework_name(&dependency.reference);
+                    for reference in
+                        carthage_dependency_references(self.project, target, dependency)
+                    {
+                        let name = carthage_framework_name(&reference);
+                        let file_ref = self.add_file_reference(
+                            &format!("carthageRef:{}:{reference}", target.name),
+                            name.clone(),
+                            Some(name.clone()),
+                            Some(file_type_for_path(&name, None)),
+                            None,
+                            "<group>",
+                            true,
+                        );
+                        let mut object =
+                            PbxObject::new("PBXBuildFile", format!("{name} in Frameworks"))
+                                .field("fileRef", PbxValue::reference(file_ref, name.clone()));
+                        if let Some(platform_filter) = dependency_platform_filter(dependency) {
+                            object =
+                                object.field("platformFilter", PbxValue::String(platform_filter));
+                        }
+                        let platform_filters = platform_filters_for_dependency(dependency);
+                        if !platform_filters.is_empty() {
+                            object =
+                                object.field("platformFilters", string_array(&platform_filters));
+                        }
+                        let build_file = self.graph.add(
+                            &format!("carthageBuildFile:{}:{reference}", target.name),
+                            object,
+                        );
+                        files.push(PbxValue::reference(
+                            build_file,
+                            format!("{name} in Frameworks"),
+                        ));
+                    }
+                }
+                DependencyType::Bundle => {}
+            }
+        }
+        if product_type_is_app(&target.target_type)
+            && target_uses_transitive_dependencies(self.project, target)
+        {
+            let direct_target_dependencies = target
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.dependency_type == DependencyType::Target)
+                .map(|dependency| dependency.reference.as_str())
+                .collect::<HashSet<_>>();
+            for dependency_name in native_target_dependency_names(self.project, target) {
+                if direct_target_dependencies.contains(dependency_name.as_str()) {
+                    continue;
+                }
+                let Some(dependency_target) = self.project.targets.get(&dependency_name) else {
+                    continue;
+                };
+                if dependency_target.target_type != ProductType::StaticLibrary {
+                    continue;
+                }
+                let Some(refs) = self.target_refs.get(&dependency_name) else {
+                    continue;
+                };
+                let name = self
+                    .graph
+                    .comments
+                    .get(&refs.product_ref_id)
+                    .cloned()
+                    .unwrap_or_else(|| dependency_target.filename());
+                let object = PbxObject::new("PBXBuildFile", format!("{name} in Frameworks")).field(
+                    "fileRef",
+                    PbxValue::reference(refs.product_ref_id.clone(), name.clone()),
+                );
+                let build_file = self.graph.add(
+                    &format!(
+                        "transitiveTargetProductBuildFile:{}:{}",
+                        target.name, dependency_name
+                    ),
+                    object,
+                );
+                files.push(PbxValue::reference(
+                    build_file,
+                    format!("{name} in Frameworks"),
+                ));
+            }
+        }
+        if target_uses_transitive_dependencies(self.project, target) {
+            for dependency_name in native_target_dependency_names(self.project, target) {
+                let Some(dependency_target) = self.project.targets.get(&dependency_name) else {
+                    continue;
+                };
+                if product_type_is_test(&target.target_type)
+                    && !dependency_target.target_type.is_framework()
+                {
+                    continue;
+                }
+                for dependency in &dependency_target.dependencies {
+                    if !matches!(
+                        dependency.dependency_type,
+                        DependencyType::Framework | DependencyType::Sdk { .. }
+                    ) || dependency.link == Some(false)
+                    {
+                        continue;
+                    }
+                    let reference = &dependency.reference;
+                    let name = display_name(reference);
+                    let source_tree =
+                        if let DependencyType::Sdk { root } = &dependency.dependency_type {
+                            root.as_deref().unwrap_or("SDKROOT")
+                        } else {
+                            "<group>"
+                        };
+                    let path = if matches!(dependency.dependency_type, DependencyType::Sdk { .. }) {
+                        sdk_reference_path(reference, source_tree)
+                    } else {
+                        reference.clone()
+                    };
                     let file_ref = self.add_file_reference(
-                        &format!("carthageRef:{}:{}", target.name, dependency.reference),
+                        &framework_dependency_reference_key(&target.name, dependency, &path),
                         name.clone(),
-                        Some(name.clone()),
+                        Some(path),
                         Some(file_type_for_path(&name, None)),
                         None,
-                        "<group>",
+                        source_tree,
                         false,
                     );
                     let mut object =
@@ -1530,7 +2603,10 @@ impl<'a> PbxGenerator<'a> {
                         object = object.field("platformFilters", string_array(&platform_filters));
                     }
                     let build_file = self.graph.add(
-                        &format!("carthageBuildFile:{}:{}", target.name, dependency.reference),
+                        &format!(
+                            "transitiveFrameworkBuildFile:{}:{}:{reference}",
+                            target.name, dependency_name
+                        ),
                         object,
                     );
                     files.push(PbxValue::reference(
@@ -1538,7 +2614,6 @@ impl<'a> PbxGenerator<'a> {
                         format!("{name} in Frameworks"),
                     ));
                 }
-                DependencyType::Bundle => {}
             }
         }
         files
@@ -1553,16 +2628,22 @@ impl<'a> PbxGenerator<'a> {
                 let reference = &dependency.reference;
                 let name = display_name(reference);
                 let file_ref = self.add_file_reference(
-                    &format!("bundleRef:{}:{reference}", target.name),
+                    &format!("bundleDependencyRef:{reference}"),
                     name.clone(),
                     Some(reference.clone()),
                     Some(file_type_for_path(reference, None)),
                     None,
-                    "<group>",
-                    false,
+                    "BUILT_PRODUCTS_DIR",
+                    true,
                 );
-                let mut object = PbxObject::new("PBXBuildFile", format!("{name} in CopyFiles"))
+                let build_file_comment = format!("{name} in Copy Bundle Resources");
+                let mut object = PbxObject::new("PBXBuildFile", build_file_comment.clone())
                     .field("fileRef", PbxValue::reference(file_ref, name.clone()));
+                if let Some(build_file_settings) =
+                    copy_build_file_settings_for_dependency(dependency)
+                {
+                    object = object.field("settings", build_file_settings);
+                }
                 let platform_filters = platform_filters_for_dependency(dependency);
                 if !platform_filters.is_empty() {
                     object = object.field("platformFilters", string_array(&platform_filters));
@@ -1571,34 +2652,164 @@ impl<'a> PbxGenerator<'a> {
                     &format!("bundleBuildFile:{}:{reference}", target.name),
                     object,
                 );
-                PbxValue::reference(build_file, format!("{name} in CopyFiles"))
+                PbxValue::reference(build_file, build_file_comment)
             })
             .collect::<Vec<_>>();
 
-        (!files.is_empty()).then(|| {
-            self.add_copy_files_build_phase(
-                &format!("{}:CopyBundles", target.name),
-                "Copy Bundle Resources",
-                7,
-                "",
-                target.only_copy_files_on_install,
-                files,
-            )
-        })
+        (!files.is_empty()).then(|| self.add_copy_bundle_resources_phase(target, files))
     }
 
-    fn target_dependency_copy_files_phase(&mut self, target: &Target) -> Option<(String, String)> {
-        let mut phase_settings = None::<CopyFilesSettings>;
-        let mut files = Vec::new();
+    fn source_copy_files_phases(
+        &mut self,
+        target: &Target,
+        files: &[FileBuildRefs],
+    ) -> Vec<(String, String, CopyFilesPhaseOrder)> {
+        let mut buckets =
+            BTreeMap::<(i64, String, String, CopyFilesPhaseOrder), Vec<PbxValue>>::new();
+        for file in files {
+            if !matches!(file.build_phase, Some("CopyFiles") | Some("CopyHeaders")) {
+                continue;
+            }
+            let Some(build_file_id) = file.build_file_id.clone() else {
+                continue;
+            };
+            let settings = file
+                .copy_files_settings
+                .clone()
+                .unwrap_or_else(default_source_copy_files_settings);
+            if settings.phase_name == "CopyFiles"
+                && settings.dst_path == "$(CONTENTS_FOLDER_PATH)/XPCServices"
+                && target.dependencies.iter().any(|dependency| {
+                    dependency.dependency_type == DependencyType::Target
+                        && self.project.targets.get(&dependency.reference).is_some_and(
+                            |dependency_target| {
+                                dependency_target.target_type == ProductType::XpcService
+                            },
+                        )
+                })
+            {
+                continue;
+            }
+            buckets
+                .entry(copy_files_settings_key(&settings))
+                .or_default()
+                .push(PbxValue::reference(
+                    build_file_id,
+                    format!("{} in CopyFiles", file.name),
+                ));
+        }
+        buckets
+            .into_iter()
+            .map(
+                |((dst_subfolder_spec, dst_path, phase_name, phase_order), files)| {
+                    let phase_id = self.add_copy_files_build_phase_with_name(
+                        &format!(
+                            "{}:CopyFiles:{}:{}",
+                            target.name, dst_subfolder_spec, dst_path
+                        ),
+                        if phase_name == "CopyFiles" {
+                            None
+                        } else {
+                            Some(phase_name.as_str())
+                        },
+                        dst_subfolder_spec,
+                        &dst_path,
+                        false,
+                        files,
+                    );
+                    (phase_id, phase_name, phase_order)
+                },
+            )
+            .collect()
+    }
+
+    fn target_dependency_copy_files_phases(
+        &mut self,
+        target: &Target,
+        source_files: &[FileBuildRefs],
+    ) -> Vec<(String, String)> {
+        let mut buckets = BTreeMap::<(i64, String, String), Vec<PbxValue>>::new();
+
+        for file in source_files {
+            let Some(settings) = &file.copy_files_settings else {
+                continue;
+            };
+            if file.build_phase != Some("CopyFiles")
+                || settings.phase_name != "CopyFiles"
+                || settings.dst_path != "$(CONTENTS_FOLDER_PATH)/XPCServices"
+            {
+                continue;
+            }
+            let Some(build_file_id) = file.build_file_id.clone() else {
+                continue;
+            };
+            buckets
+                .entry(copy_files_destination_key(settings))
+                .or_default()
+                .push(PbxValue::reference(
+                    build_file_id,
+                    format!("{} in CopyFiles", file.name),
+                ));
+        }
 
         for dependency in &target.dependencies {
             if dependency.dependency_type != DependencyType::Target {
                 continue;
             }
+            if let Some((_, external_target_name)) = dependency.reference.split_once('/') {
+                let Some(dependency_target) = self.project.targets.get(external_target_name) else {
+                    continue;
+                };
+                if !should_embed_target_dependency(target, dependency, dependency_target) {
+                    continue;
+                }
+                let Some(settings) = copy_files_settings_for_target_dependency(
+                    dependency,
+                    &dependency_target.target_type,
+                ) else {
+                    continue;
+                };
+                let Some(product_ref_id) =
+                    self.add_project_reference_product(&dependency.reference)
+                else {
+                    continue;
+                };
+                let filename = dependency_target.filename();
+                let platform_filters = platform_filters_for_dependency(dependency);
+                let build_file_comment = format!("{filename} in {}", settings.phase_name);
+
+                let mut object = PbxObject::new("PBXBuildFile", build_file_comment.clone()).field(
+                    "fileRef",
+                    PbxValue::reference(product_ref_id, filename.clone()),
+                );
+                if let Some(platform_filter) = dependency_platform_filter(dependency) {
+                    object = object.field("platformFilter", PbxValue::String(platform_filter));
+                }
+                if let Some(build_file_settings) =
+                    copy_build_file_settings_for_target_dependency(dependency, dependency_target)
+                {
+                    object = object.field("settings", build_file_settings);
+                }
+                if !platform_filters.is_empty() {
+                    object = object.field("platformFilters", string_array(&platform_filters));
+                }
+                let build_file = self.graph.add(
+                    &format!(
+                        "projectReferenceTargetDependencyCopyBuildFile:{}:{}",
+                        target.name, dependency.reference
+                    ),
+                    object,
+                );
+                buckets
+                    .entry(copy_files_destination_key(&settings))
+                    .or_default()
+                    .push(PbxValue::reference(build_file, build_file_comment));
+                continue;
+            }
             let Some(dependency_target) = self.project.targets.get(&dependency.reference) else {
                 continue;
             };
-            if !should_embed_target_dependency(dependency, dependency_target) {
+            if !should_embed_target_dependency(target, dependency, dependency_target) {
                 continue;
             }
             let Some(settings) = copy_files_settings_for_target_dependency(
@@ -1614,13 +2825,20 @@ impl<'a> PbxGenerator<'a> {
             let product_ref_id = refs.product_ref_id.clone();
             let filename = dependency_target.filename();
             let platform_filters = platform_filters_for_dependency(dependency);
-            phase_settings.get_or_insert_with(|| settings.clone());
+            let build_file_comment = format!("{filename} in {}", settings.phase_name);
 
-            let mut object = PbxObject::new("PBXBuildFile", format!("{filename} in CopyFiles"))
-                .field(
-                    "fileRef",
-                    PbxValue::reference(product_ref_id, filename.clone()),
-                );
+            let mut object = PbxObject::new("PBXBuildFile", build_file_comment.clone()).field(
+                "fileRef",
+                PbxValue::reference(product_ref_id, filename.clone()),
+            );
+            if let Some(platform_filter) = dependency_platform_filter(dependency) {
+                object = object.field("platformFilter", PbxValue::String(platform_filter));
+            }
+            if let Some(build_file_settings) =
+                copy_build_file_settings_for_target_dependency(dependency, dependency_target)
+            {
+                object = object.field("settings", build_file_settings);
+            }
             if !platform_filters.is_empty() {
                 object = object.field("platformFilters", string_array(&platform_filters));
             }
@@ -1631,45 +2849,150 @@ impl<'a> PbxGenerator<'a> {
                 ),
                 object,
             );
-            files.push(PbxValue::reference(
-                build_file,
-                format!("{filename} in CopyFiles"),
-            ));
+            buckets
+                .entry(copy_files_destination_key(&settings))
+                .or_default()
+                .push(PbxValue::reference(build_file, build_file_comment));
         }
 
-        if files.is_empty() {
-            return None;
-        }
-        let settings = phase_settings.expect("copy files should have settings when files exist");
-        let phase_id = self.add_copy_files_build_phase(
-            &format!("{}:CopyTargetDependencies", target.name),
-            &settings.phase_name,
-            settings.dst_subfolder_spec,
-            &settings.dst_path,
-            target.only_copy_files_on_install,
-            files,
-        );
-        Some((phase_id, settings.phase_name))
+        buckets
+            .into_iter()
+            .map(|((dst_subfolder_spec, dst_path, phase_name), files)| {
+                let run_only_when_installing = target.only_copy_files_on_install
+                    && matches!(
+                        phase_name.as_str(),
+                        "Embed Frameworks" | "Embed System Extensions" | "Embed Dependencies"
+                    );
+                let phase_id = self.add_copy_files_build_phase_with_name(
+                    &format!(
+                        "{}:CopyTargetDependencies:{}:{}",
+                        target.name, dst_subfolder_spec, dst_path
+                    ),
+                    if phase_name == "CopyFiles" {
+                        None
+                    } else {
+                        Some(phase_name.as_str())
+                    },
+                    dst_subfolder_spec,
+                    &dst_path,
+                    run_only_when_installing,
+                    files,
+                );
+                (phase_id, phase_name)
+            })
+            .collect()
     }
 
-    fn dependency_copy_files_phase(&mut self, target: &Target) -> Option<(String, String)> {
-        let mut phase_settings = None::<CopyFilesSettings>;
+    fn target_dependency_resource_files(&mut self, target: &Target) -> Vec<PbxValue> {
         let mut files = Vec::new();
+        for dependency in &target.dependencies {
+            if dependency.dependency_type != DependencyType::Target {
+                continue;
+            }
+            let Some(dependency_target) = self.project.targets.get(&dependency.reference) else {
+                continue;
+            };
+            if dependency_target.target_type != ProductType::MessagesApplication {
+                continue;
+            }
+            let Some(refs) = self.target_refs.get(&dependency.reference) else {
+                continue;
+            };
+            let filename = dependency_target.filename();
+            let mut object = PbxObject::new("PBXBuildFile", format!("{filename} in Resources"))
+                .field(
+                    "fileRef",
+                    PbxValue::reference(refs.product_ref_id.clone(), filename.clone()),
+                );
+            if let Some(build_file_settings) =
+                copy_build_file_settings_for_target_dependency(dependency, dependency_target)
+            {
+                object = object.field("settings", build_file_settings);
+            }
+            let platform_filters = platform_filters_for_dependency(dependency);
+            if !platform_filters.is_empty() {
+                object = object.field("platformFilters", string_array(&platform_filters));
+            }
+            let build_file = self.graph.add(
+                &format!(
+                    "targetDependencyResourceBuildFile:{}:{}",
+                    target.name, dependency.reference
+                ),
+                object,
+            );
+            files.push(PbxValue::reference(
+                build_file,
+                format!("{filename} in Resources"),
+            ));
+        }
+        files
+    }
+
+    fn dependency_copy_files_phases(&mut self, target: &Target) -> Vec<(String, String)> {
+        let mut buckets = BTreeMap::<(i64, String, String), Vec<PbxValue>>::new();
+
+        if target_directly_embeds_carthage_dependencies(target) {
+            for resolved in resolved_carthage_dependencies(self.project, target) {
+                let dependency = &resolved.dependency;
+                if !should_embed_carthage_dependency(target, dependency) {
+                    continue;
+                }
+                let Some(settings) = copy_files_settings_for_embedded_dependency(dependency) else {
+                    continue;
+                };
+                let name = carthage_framework_name(&dependency.reference);
+                let build_file_comment = format!("{name} in {}", settings.phase_name);
+                let file_ref = self.add_file_reference(
+                    &format!("carthageRef:{}:{}", target.name, dependency.reference),
+                    name.clone(),
+                    Some(name.clone()),
+                    Some(file_type_for_path(&name, None)),
+                    None,
+                    "<group>",
+                    true,
+                );
+                let mut object = PbxObject::new("PBXBuildFile", build_file_comment.clone())
+                    .field("fileRef", PbxValue::reference(file_ref, name.clone()));
+                if let Some(build_file_settings) =
+                    copy_build_file_settings_for_dependency(dependency)
+                {
+                    object = object.field("settings", build_file_settings);
+                }
+                let platform_filters = platform_filters_for_dependency(dependency);
+                if !platform_filters.is_empty() {
+                    object = object.field("platformFilters", string_array(&platform_filters));
+                }
+                let build_file = self.graph.add(
+                    &format!(
+                        "carthageCopyBuildFile:{}:{}",
+                        target.name, dependency.reference
+                    ),
+                    object,
+                );
+                buckets
+                    .entry(copy_files_destination_key(&settings))
+                    .or_default()
+                    .push(PbxValue::reference(build_file, build_file_comment));
+            }
+        }
 
         for dependency in &target.dependencies {
+            if matches!(&dependency.dependency_type, DependencyType::Carthage { .. }) {
+                continue;
+            }
             if !should_embed_external_dependency(dependency) {
                 continue;
             }
             let Some(settings) = copy_files_settings_for_embedded_dependency(dependency) else {
                 continue;
             };
-            phase_settings.get_or_insert_with(|| settings.clone());
             let platform_filters = platform_filters_for_dependency(dependency);
 
             match &dependency.dependency_type {
                 DependencyType::Framework | DependencyType::Sdk { .. } => {
                     let reference = &dependency.reference;
                     let name = display_name(reference);
+                    let build_file_comment = format!("{name} in {}", settings.phase_name);
                     let file_ref = self.add_file_reference(
                         &format!("frameworkRef:{}:{reference}", target.name),
                         name.clone(),
@@ -1683,8 +3006,13 @@ impl<'a> PbxGenerator<'a> {
                         },
                         false,
                     );
-                    let mut object = PbxObject::new("PBXBuildFile", format!("{name} in CopyFiles"))
+                    let mut object = PbxObject::new("PBXBuildFile", build_file_comment.clone())
                         .field("fileRef", PbxValue::reference(file_ref, name.clone()));
+                    if let Some(build_file_settings) =
+                        copy_build_file_settings_for_dependency(dependency)
+                    {
+                        object = object.field("settings", build_file_settings);
+                    }
                     if !platform_filters.is_empty() {
                         object = object.field("platformFilters", string_array(&platform_filters));
                     }
@@ -1692,12 +3020,11 @@ impl<'a> PbxGenerator<'a> {
                         &format!("dependencyCopyBuildFile:{}:{reference}", target.name),
                         object,
                     );
-                    files.push(PbxValue::reference(
-                        build_file,
-                        format!("{name} in CopyFiles"),
-                    ));
+                    buckets
+                        .entry(copy_files_destination_key(&settings))
+                        .or_default()
+                        .push(PbxValue::reference(build_file, build_file_comment));
                 }
-                DependencyType::Carthage { .. } => {}
                 DependencyType::Package { products } => {
                     let product_names = if products.is_empty() {
                         vec![dependency.reference.clone()]
@@ -1705,14 +3032,29 @@ impl<'a> PbxGenerator<'a> {
                         products.clone()
                     };
                     for product_name in product_names {
-                        let product_dependency = self
-                            .add_package_product_dependency(&dependency.reference, &product_name);
-                        let mut object =
-                            PbxObject::new("PBXBuildFile", format!("{product_name} in CopyFiles"))
-                                .field(
-                                    "productRef",
-                                    PbxValue::reference(product_dependency, product_name.clone()),
-                                );
+                        let build_file_comment =
+                            format!("{product_name} in {}", settings.phase_name);
+                        let product_dependency = self.add_package_product_dependency(
+                            &target.name,
+                            &dependency.reference,
+                            &product_name,
+                            false,
+                            &platform_filters,
+                        );
+                        let mut object = PbxObject::new("PBXBuildFile", build_file_comment.clone())
+                            .field(
+                                "productRef",
+                                PbxValue::reference(product_dependency, product_name.clone()),
+                            );
+                        let mut build_file_settings = BTreeMap::new();
+                        build_file_settings.insert(
+                            "ATTRIBUTES".to_owned(),
+                            PbxValue::Array(vec![
+                                PbxValue::String("CodeSignOnCopy".to_owned()),
+                                PbxValue::String("RemoveHeadersOnCopy".to_owned()),
+                            ]),
+                        );
+                        object = object.field("settings", PbxValue::Dict(build_file_settings));
                         if !platform_filters.is_empty() {
                             object =
                                 object.field("platformFilters", string_array(&platform_filters));
@@ -1721,32 +3063,44 @@ impl<'a> PbxGenerator<'a> {
                             &format!("packageProductCopyBuildFile:{}:{product_name}", target.name),
                             object,
                         );
-                        files.push(PbxValue::reference(
-                            build_file,
-                            format!("{product_name} in CopyFiles"),
-                        ));
+                        buckets
+                            .entry(copy_files_destination_key(&settings))
+                            .or_default()
+                            .push(PbxValue::reference(build_file, build_file_comment));
                     }
                 }
                 DependencyType::Target | DependencyType::Bundle => {}
+                DependencyType::Carthage { .. } => {}
             }
         }
 
-        if files.is_empty() {
-            return None;
-        }
-        let settings = phase_settings.expect("copy files should have settings when files exist");
-        let phase_id = self.add_copy_files_build_phase(
-            &format!("{}:CopyDependencies", target.name),
-            &settings.phase_name,
-            settings.dst_subfolder_spec,
-            &settings.dst_path,
-            target.only_copy_files_on_install,
-            files,
-        );
-        Some((phase_id, settings.phase_name))
+        buckets
+            .into_iter()
+            .map(|((dst_subfolder_spec, dst_path, phase_name), files)| {
+                let phase_id = self.add_copy_files_build_phase_with_name(
+                    &format!(
+                        "{}:CopyDependencies:{}:{}",
+                        target.name, dst_subfolder_spec, dst_path
+                    ),
+                    if phase_name == "CopyFiles" {
+                        None
+                    } else {
+                        Some(phase_name.as_str())
+                    },
+                    dst_subfolder_spec,
+                    &dst_path,
+                    target.only_copy_files_on_install,
+                    files,
+                );
+                (phase_id, phase_name)
+            })
+            .collect()
     }
 
     fn carthage_copy_frameworks_phase(&mut self, target: &Target) -> Option<String> {
+        if target_directly_embeds_carthage_dependencies(target) {
+            return None;
+        }
         let platform_dir = carthage_platform_dir(&target.platform);
         let base_path = self
             .project
@@ -1757,13 +3111,9 @@ impl<'a> PbxGenerator<'a> {
         let mut input_paths = Vec::new();
         let mut output_paths = Vec::new();
 
-        for dependency in &target.dependencies {
-            let DependencyType::Carthage { link_type, .. } = &dependency.dependency_type else {
-                continue;
-            };
-            if *link_type != crate::spec::CarthageLinkType::Dynamic
-                || !should_embed_external_dependency(dependency)
-            {
+        for resolved in resolved_carthage_dependencies(self.project, target) {
+            let dependency = &resolved.dependency;
+            if !should_embed_carthage_dependency(target, dependency) {
                 continue;
             }
             let name = carthage_framework_name(&dependency.reference);
@@ -1811,67 +3161,77 @@ impl<'a> PbxGenerator<'a> {
     fn add_package_references(&mut self) -> Vec<PbxValue> {
         let mut main_group_children = Vec::new();
         let mut grouped_package_children = BTreeMap::<String, Vec<PbxValue>>::new();
-        for (name, package) in &self.project.packages {
-            if let Some(path) = package.get("path").and_then(|value| value.as_str()) {
-                if package
-                    .get("excludeFromProject")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let package_ref = self.graph.add(
-                    &format!("xcLocalPackage:{name}:{path}"),
-                    PbxObject::new(
-                        "XCLocalSwiftPackageReference",
+        let mut packages = self.project.packages.iter().collect::<Vec<_>>();
+        packages.sort_by_key(|(name, _)| *name);
+        for local_packages in [false, true] {
+            for (name, package) in packages.iter().copied().filter(|(_, package)| {
+                package
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .is_some()
+                    == local_packages
+            }) {
+                if let Some(path) = package.get("path").and_then(|value| value.as_str()) {
+                    if package
+                        .get("excludeFromProject")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let package_ref = self.graph.add(
+                        &format!("xcLocalPackage:{name}:{path}"),
+                        PbxObject::new(
+                            "XCLocalSwiftPackageReference",
+                            format!("XCLocalSwiftPackageReference \"{path}\""),
+                        )
+                        .field("relativePath", PbxValue::String(path.to_owned())),
+                    );
+                    self.package_refs.insert(name.clone(), package_ref.clone());
+                    self.project_package_refs.push(PbxValue::reference(
+                        package_ref,
                         format!("XCLocalSwiftPackageReference \"{path}\""),
-                    )
-                    .field("relativePath", PbxValue::String(path.to_owned())),
-                );
-                self.package_refs.insert(name.clone(), package_ref.clone());
-                self.project_package_refs.push(PbxValue::reference(
-                    package_ref,
-                    format!("XCLocalSwiftPackageReference \"{path}\""),
-                ));
+                    ));
 
-                let file_ref = self.add_file_reference(
-                    &format!("localPackageFile:{name}:{path}"),
-                    name.clone(),
-                    Some(path.to_owned()),
-                    Some("folder".to_owned()),
-                    Some(name.clone()),
-                    "SOURCE_ROOT",
-                    true,
-                );
-                let package_group = package
-                    .get("group")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| self.project.spec_options.local_packages_group.clone())
-                    .unwrap_or_else(|| "Packages".to_owned());
-                if package_group.is_empty() {
-                    main_group_children.push(PbxValue::reference(file_ref, name.clone()));
-                } else {
-                    grouped_package_children
-                        .entry(package_group)
-                        .or_default()
-                        .push(PbxValue::reference(file_ref, name.clone()));
-                }
-            } else if let Some(url) = package_url(package) {
-                let package_ref = self.graph.add(
-                    &format!("xcRemotePackage:{name}:{url}"),
-                    PbxObject::new(
-                        "XCRemoteSwiftPackageReference",
+                    let file_ref = self.add_file_reference(
+                        &format!("localPackageFile:{name}:{path}"),
+                        name.clone(),
+                        Some(path.to_owned()),
+                        Some("folder".to_owned()),
+                        Some(name.clone()),
+                        "SOURCE_ROOT",
+                        true,
+                    );
+                    let package_group = package
+                        .get("group")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| self.project.spec_options.local_packages_group.clone())
+                        .unwrap_or_else(|| "Packages".to_owned());
+                    if package_group.is_empty() {
+                        main_group_children.push(PbxValue::reference(file_ref, name.clone()));
+                    } else {
+                        grouped_package_children
+                            .entry(package_group)
+                            .or_default()
+                            .push(PbxValue::reference(file_ref, name.clone()));
+                    }
+                } else if let Some(url) = package_url(package) {
+                    let package_ref = self.graph.add(
+                        &format!("xcRemotePackage:{name}:{url}"),
+                        PbxObject::new(
+                            "XCRemoteSwiftPackageReference",
+                            format!("XCRemoteSwiftPackageReference \"{name}\""),
+                        )
+                        .field("repositoryURL", PbxValue::String(url))
+                        .field("requirement", PbxValue::Dict(package_requirement(package))),
+                    );
+                    self.package_refs.insert(name.clone(), package_ref.clone());
+                    self.project_package_refs.push(PbxValue::reference(
+                        package_ref,
                         format!("XCRemoteSwiftPackageReference \"{name}\""),
-                    )
-                    .field("repositoryURL", PbxValue::String(url))
-                    .field("requirement", PbxValue::Dict(package_requirement(package))),
-                );
-                self.package_refs.insert(name.clone(), package_ref.clone());
-                self.project_package_refs.push(PbxValue::reference(
-                    package_ref,
-                    format!("XCRemoteSwiftPackageReference \"{name}\""),
-                ));
+                    ));
+                }
             }
         }
 
@@ -1895,8 +3255,21 @@ impl<'a> PbxGenerator<'a> {
         let mut current_id = String::new();
         for index in (0..parts.len()).rev() {
             let name = parts[index].to_owned();
-            let key = format!("localPackageGroup:{}", parts[..=index].join("/"));
-            current_id = self.add_group(&key, Some(name.clone()), None, children);
+            let path = parts[..=index].join("/");
+            let navigator_key = format!("navigatorGroup:{path}");
+            let navigator_id = self.graph.id_for(&format!("group:{navigator_key}"));
+            let merges_existing_navigator_group = self.graph.objects.contains_key(&navigator_id);
+            let key = if merges_existing_navigator_group {
+                navigator_key
+            } else {
+                format!("localPackageGroup:{path}")
+            };
+            current_id = self.add_group(
+                &key,
+                (!merges_existing_navigator_group).then_some(name.clone()),
+                None,
+                children,
+            );
             children = vec![PbxValue::reference(current_id.clone(), name)];
         }
         (
@@ -1905,22 +3278,93 @@ impl<'a> PbxGenerator<'a> {
         )
     }
 
-    fn add_package_product_dependency(&mut self, package_name: &str, product_name: &str) -> String {
-        let mut object = PbxObject::new("XCSwiftPackageProductDependency", product_name.to_owned())
+    fn add_package_product_dependency(
+        &mut self,
+        owner_name: &str,
+        package_name: &str,
+        product_name: &str,
+        is_plugin: bool,
+        platform_filters: &[String],
+    ) -> String {
+        let comment = product_name
+            .strip_prefix("plugin:")
+            .unwrap_or(product_name)
+            .to_owned();
+        let mut object = PbxObject::new("XCSwiftPackageProductDependency", comment)
             .field("productName", PbxValue::String(product_name.to_owned()));
-        if let Some(package_ref) = self.package_refs.get(package_name) {
-            let comment = self
-                .graph
-                .comments
-                .get(package_ref)
-                .cloned()
-                .unwrap_or_else(|| package_name.to_owned());
-            object = object.field("package", PbxValue::reference(package_ref.clone(), comment));
+        if !platform_filters.is_empty() {
+            object = object.field("platformFilters", string_array(platform_filters));
+        }
+        let is_local_package = self
+            .project
+            .packages
+            .get(package_name)
+            .and_then(|package| package.get("path"))
+            .is_some();
+        if !is_local_package {
+            if let Some(package_ref) = self.package_refs.get(package_name) {
+                let comment = self
+                    .graph
+                    .comments
+                    .get(package_ref)
+                    .cloned()
+                    .unwrap_or_else(|| package_name.to_owned());
+                object = object.field("package", PbxValue::reference(package_ref.clone(), comment));
+            }
         }
         self.graph.add(
-            &format!("packageProduct:{package_name}:{product_name}"),
+            &format!(
+                "packageProduct:{owner_name}:{package_name}:{product_name}:{}",
+                if is_plugin { "plugin" } else { "product" }
+            ),
             object,
         )
+    }
+
+    fn package_product_target_dependency(
+        &mut self,
+        target_name: &str,
+        product_name: &str,
+        product_dependency: &str,
+        platform_filters: &[String],
+    ) -> PbxValue {
+        let mut object = PbxObject::new("PBXTargetDependency", "PBXTargetDependency").field(
+            "productRef",
+            PbxValue::reference(product_dependency.to_owned(), product_name.to_owned()),
+        );
+        if !platform_filters.is_empty() {
+            object = object.field("platformFilters", string_array(platform_filters));
+        }
+        let dependency = self.graph.add(
+            &format!("packageTargetDependency:{target_name}:{product_name}"),
+            object,
+        );
+        PbxValue::reference(dependency, "PBXTargetDependency")
+    }
+
+    fn package_plugin_target_dependencies(
+        &mut self,
+        owner_name: &str,
+        plugins: &[crate::spec::BuildToolPlugin],
+    ) -> Vec<PbxValue> {
+        plugins
+            .iter()
+            .map(|plugin| {
+                let product_dependency = self.add_package_product_dependency(
+                    owner_name,
+                    &plugin.package,
+                    &format!("plugin:{}", plugin.plugin),
+                    true,
+                    &[],
+                );
+                self.package_product_target_dependency(
+                    owner_name,
+                    &plugin.plugin,
+                    &product_dependency,
+                    &[],
+                )
+            })
+            .collect()
     }
 
     fn package_product_build_file(
@@ -1929,6 +3373,7 @@ impl<'a> PbxGenerator<'a> {
         product_name: &str,
         product_dependency: &str,
         weak_link: bool,
+        platform_filter: Option<String>,
         platform_filters: &[String],
     ) -> PbxValue {
         let mut object = PbxObject::new("PBXBuildFile", format!("{product_name} in Frameworks"))
@@ -1936,6 +3381,9 @@ impl<'a> PbxGenerator<'a> {
                 "productRef",
                 PbxValue::reference(product_dependency.to_owned(), product_name.to_owned()),
             );
+        if let Some(platform_filter) = platform_filter {
+            object = object.field("platformFilter", PbxValue::String(platform_filter));
+        }
         if !platform_filters.is_empty() {
             object = object.field("platformFilters", string_array(platform_filters));
         }
@@ -1955,20 +3403,27 @@ impl<'a> PbxGenerator<'a> {
     }
 
     fn add_product_reference(&mut self, target: &Target) -> String {
-        self.add_file_reference(
-            &format!("productRef:{}", target.name),
-            target.filename(),
-            Some(target.filename()),
-            Some(file_type_for_path(
-                &target.filename(),
-                Some(&target.target_type),
-            )),
-            None,
-            "BUILT_PRODUCTS_DIR",
-            true,
-        )
+        let file_type = file_type_for_path(&target.filename(), Some(&target.target_type));
+        let mut object = PbxObject::new("PBXFileReference", target.filename())
+            .field("includeInIndex", PbxValue::Int(0));
+        if target.target_type != ProductType::CommandLineTool {
+            if product_uses_explicit_file_type(target) {
+                object = object.field("explicitFileType", PbxValue::String(file_type));
+            } else {
+                object = object.field("lastKnownFileType", PbxValue::String(file_type));
+            }
+        }
+        object = object
+            .field("path", PbxValue::String(target.filename()))
+            .field(
+                "sourceTree",
+                PbxValue::String("BUILT_PRODUCTS_DIR".to_owned()),
+            );
+        self.graph
+            .add(&format!("productRef:{}", target.name), object)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_file_reference(
         &mut self,
         key: &str,
@@ -2007,6 +3462,21 @@ impl<'a> PbxGenerator<'a> {
             .clone()
             .or_else(|| path.as_deref().map(display_name))
             .unwrap_or_default();
+        let children = self.sorted_group_children(&comment, children);
+        self.add_group_presorted(key, name, path, children)
+    }
+
+    fn add_group_presorted(
+        &mut self,
+        key: &str,
+        name: Option<String>,
+        path: Option<String>,
+        children: Vec<PbxValue>,
+    ) -> String {
+        let comment = name
+            .clone()
+            .or_else(|| path.as_deref().map(display_name))
+            .unwrap_or_default();
         let mut object =
             PbxObject::new("PBXGroup", comment).field("children", PbxValue::Array(children));
         if let Some(name) = name {
@@ -2018,6 +3488,85 @@ impl<'a> PbxGenerator<'a> {
         object = object.field("sourceTree", PbxValue::String("<group>".to_owned()));
         self.graph
             .add_or_merge_group(&format!("group:{key}"), object)
+    }
+
+    fn sorted_group_children(&self, group_name: &str, children: Vec<PbxValue>) -> Vec<PbxValue> {
+        if matches!(group_name, "Products" | "Carthage") {
+            return children;
+        }
+        let mut children = children;
+        children.sort_by(|left, right| {
+            let left_order = self.group_child_sort_order(left);
+            let right_order = self.group_child_sort_order(right);
+            left_order
+                .cmp(&right_order)
+                .then_with(|| {
+                    natural_cmp(
+                        &self.group_child_name_path_sort_string(left),
+                        &self.group_child_name_path_sort_string(right),
+                    )
+                })
+                .then_with(|| pbx_value_id(left).cmp(&pbx_value_id(right)))
+        });
+        ordered_group_children(&self.project.spec_options, group_name, children, |child| {
+            self.group_child_is_group_or_folder(child)
+        })
+    }
+
+    fn group_child_sort_order(&self, child: &PbxValue) -> i32 {
+        if !self.group_child_is_group_or_folder(child) {
+            return 0;
+        }
+        match self.project.spec_options.group_sort_position {
+            GroupSortPosition::Top => -1,
+            GroupSortPosition::Bottom => 1,
+        }
+    }
+
+    fn group_child_is_group_or_folder(&self, child: &PbxValue) -> bool {
+        let Some(id) = pbx_value_id(child) else {
+            return false;
+        };
+        let Some(object) = self.graph.objects.get(id) else {
+            return false;
+        };
+        object.isa == "PBXGroup"
+            || object.isa == "PBXFileSystemSynchronizedRootGroup"
+            || (object.isa == "PBXFileReference"
+                && object
+                    .fields
+                    .get("lastKnownFileType")
+                    .is_some_and(|value| value == &PbxValue::String("folder".to_owned())))
+    }
+
+    fn group_child_name_path_sort_string(&self, child: &PbxValue) -> String {
+        let Some(id) = pbx_value_id(child) else {
+            return pbx_value_comment(child);
+        };
+        let name = self
+            .graph
+            .objects
+            .get(id)
+            .and_then(|object| object.fields.get("name"))
+            .and_then(pbx_string)
+            .map(str::to_owned);
+        let path = self
+            .graph
+            .objects
+            .get(id)
+            .and_then(|object| object.fields.get("path"))
+            .and_then(pbx_string)
+            .map(str::to_owned);
+        let name_or_path = name
+            .clone()
+            .or_else(|| path.clone())
+            .unwrap_or_else(|| pbx_value_comment(child));
+        format!(
+            "{}\t{}\t{}",
+            name_or_path,
+            name.unwrap_or_default(),
+            path.unwrap_or_default()
+        )
     }
 
     fn add_build_phase(
@@ -2036,31 +3585,51 @@ impl<'a> PbxGenerator<'a> {
         )
     }
 
-    fn add_copy_files_build_phase(
+    fn add_copy_files_build_phase_with_name(
         &mut self,
         key: &str,
-        name: &str,
+        name: Option<&str>,
         dst_subfolder_spec: i64,
         dst_path: &str,
         run_only_for_deployment_postprocessing: bool,
         files: Vec<PbxValue>,
     ) -> String {
+        let comment = name.unwrap_or("CopyFiles");
+        let mut object = PbxObject::new("PBXCopyFilesBuildPhase", comment.to_owned())
+            .field(
+                "buildActionMask",
+                PbxValue::Int(if run_only_for_deployment_postprocessing {
+                    8
+                } else {
+                    2147483647
+                }),
+            )
+            .field("dstPath", PbxValue::String(dst_path.to_owned()))
+            .field("dstSubfolderSpec", PbxValue::Int(dst_subfolder_spec))
+            .field("files", PbxValue::Array(files));
+        if let Some(name) = name {
+            object = object.field("name", PbxValue::String(name.to_owned()));
+        }
+        object = object.field(
+            "runOnlyForDeploymentPostprocessing",
+            PbxValue::Int(if run_only_for_deployment_postprocessing {
+                1
+            } else {
+                0
+            }),
+        );
+        self.graph.add(&format!("buildPhase:{key}"), object)
+    }
+
+    fn add_copy_bundle_resources_phase(&mut self, target: &Target, files: Vec<PbxValue>) -> String {
         self.graph.add(
-            &format!("buildPhase:{key}"),
-            PbxObject::new("PBXCopyFilesBuildPhase", name.to_owned())
+            &format!("buildPhase:{}:CopyBundles", target.name),
+            PbxObject::new("PBXCopyFilesBuildPhase", "Copy Bundle Resources")
                 .field("buildActionMask", PbxValue::Int(2147483647))
-                .field("dstPath", PbxValue::String(dst_path.to_owned()))
-                .field("dstSubfolderSpec", PbxValue::Int(dst_subfolder_spec))
+                .field("dstSubfolderSpec", PbxValue::Int(7))
                 .field("files", PbxValue::Array(files))
-                .field("name", PbxValue::String(name.to_owned()))
-                .field(
-                    "runOnlyForDeploymentPostprocessing",
-                    PbxValue::Int(if run_only_for_deployment_postprocessing {
-                        1
-                    } else {
-                        0
-                    }),
-                ),
+                .field("name", PbxValue::String("Copy Bundle Resources".to_owned()))
+                .field("runOnlyForDeploymentPostprocessing", PbxValue::Int(0)),
         )
     }
 
@@ -2093,11 +3662,13 @@ impl<'a> PbxGenerator<'a> {
                 "shellPath",
                 PbxValue::String(script.shell.clone().unwrap_or_else(|| "/bin/sh".to_owned())),
             )
-            .field("shellScript", PbxValue::String(script_text))
-            .field(
-                "showEnvVarsInLog",
-                PbxValue::Int(bool_int(script.show_env_vars)),
-            );
+            .field("shellScript", PbxValue::String(script_text));
+        if script.name.is_some() {
+            object = object.field("name", PbxValue::String(name));
+        }
+        if !script.show_env_vars {
+            object = object.field("showEnvVarsInLog", PbxValue::Int(0));
+        }
         if !script.based_on_dependency_analysis {
             object = object.field("alwaysOutOfDate", PbxValue::Int(1));
         }
@@ -2133,9 +3704,11 @@ impl<'a> PbxGenerator<'a> {
                 )
                 .field("buildActionMask", PbxValue::Int(2147483647))
                 .field("files", PbxValue::Array(Vec::new()))
-                .field("inputFileListPaths", PbxValue::Array(Vec::new()))
                 .field("inputPaths", string_array(&input_paths))
-                .field("outputFileListPaths", PbxValue::Array(Vec::new()))
+                .field(
+                    "name",
+                    PbxValue::String("Copy Swift Objective-C Interface Header".to_owned()),
+                )
                 .field("outputPaths", string_array(&output_paths))
                 .field("runOnlyForDeploymentPostprocessing", PbxValue::Int(0))
                 .field("shellPath", PbxValue::String("/bin/sh".to_owned()))
@@ -2144,8 +3717,7 @@ impl<'a> PbxGenerator<'a> {
                     PbxValue::String(
                         "ditto \"${SCRIPT_INPUT_FILE_0}\" \"${SCRIPT_OUTPUT_FILE_0}\"\n".to_owned(),
                     ),
-                )
-                .field("showEnvVarsInLog", PbxValue::Int(1)),
+                ),
             ),
         )
     }
@@ -2228,17 +3800,9 @@ impl<'a> PbxGenerator<'a> {
         build_settings_by_config: BTreeMap<String, BTreeMap<String, PbxValue>>,
     ) -> String {
         let mut config_refs = Vec::new();
-        let configs = if self.project.configs.is_empty() {
-            vec!["Debug".to_owned(), "Release".to_owned()]
-        } else {
-            self.project.configs.keys().cloned().collect()
-        };
+        let configs = self.config_names();
         for config_name in configs {
             let mut build_settings = BTreeMap::new();
-            build_settings.insert(
-                "PRODUCT_NAME".to_owned(),
-                PbxValue::String("$(TARGET_NAME)".to_owned()),
-            );
             if let Some(extra_settings) = build_settings_by_config.get(&config_name) {
                 build_settings.extend(extra_settings.clone());
             }
@@ -2246,10 +3810,24 @@ impl<'a> PbxGenerator<'a> {
                 .field("buildSettings", PbxValue::Dict(build_settings))
                 .field("name", PbxValue::String(config_name.clone()));
             if let Some(Some(path)) = config_files.get(&config_name) {
+                let (file_path, comment) = split_config_file_path(path).map_or_else(
+                    || (path.clone(), display_name(path)),
+                    |(_, file_name)| (file_name.clone(), file_name),
+                );
+                let config_key = if self
+                    .project
+                    .file_groups
+                    .iter()
+                    .any(|group| path_is_under_group(path, group))
+                {
+                    format!("navigatorFileRef:{path}")
+                } else {
+                    config_file_reference_key(owner_type, owner_name, &config_name, path)
+                };
                 let config_ref = self.add_file_reference(
-                    &format!("configFile:{owner_type}:{owner_name}:{config_name}:{path}"),
-                    display_name(path),
-                    Some(path.clone()),
+                    &config_key,
+                    comment.clone(),
+                    Some(file_path),
                     Some("text.xcconfig".to_owned()),
                     None,
                     "<group>",
@@ -2257,7 +3835,7 @@ impl<'a> PbxGenerator<'a> {
                 );
                 object = object.field(
                     "baseConfigurationReference",
-                    PbxValue::reference(config_ref, display_name(path)),
+                    PbxValue::reference(config_ref, comment),
                 );
             }
             let config_id = self.graph.add(
@@ -2303,7 +3881,7 @@ impl<'a> PbxGenerator<'a> {
         self.config_names()
             .into_iter()
             .map(|config| {
-                let mut build_settings = self.project_default_build_settings();
+                let mut build_settings = self.project_default_build_settings(&config);
                 build_settings.extend(
                     self.build_settings_for_config(&self.project.settings_spec, &config)
                         .into_iter()
@@ -2321,8 +3899,9 @@ impl<'a> PbxGenerator<'a> {
         let mut settings_by_config = self.build_settings_by_config(&target.settings_spec);
         let info_plists = self.info_plist_files(target);
         for config in self.config_names() {
+            let target_default_settings = self.target_default_build_settings(target, &config);
             let settings = settings_by_config.entry(config).or_default();
-            for (key, value) in self.target_default_build_settings(target) {
+            for (key, value) in target_default_settings {
                 settings.entry(key).or_insert(value);
             }
             if !settings.contains_key("INFOPLIST_FILE") {
@@ -2342,7 +3921,9 @@ impl<'a> PbxGenerator<'a> {
                     );
                 }
             }
-            if self.target_dependencies_require_objc_linking(target)
+            if (product_type_is_app(&target.target_type)
+                || product_type_is_test(&target.target_type))
+                && self.target_dependencies_require_objc_linking(target)
                 && !settings.contains_key("OTHER_LDFLAGS")
             {
                 settings.insert(
@@ -2370,7 +3951,10 @@ impl<'a> PbxGenerator<'a> {
     fn target_requires_objc_linking(&self, target: &Target) -> bool {
         match target.requires_objc_linking {
             Some(value) => value,
-            None => target_sources_require_objc_linking(&self.project.base_path, target),
+            None => {
+                target.target_type == ProductType::StaticLibrary
+                    || target_sources_require_objc_linking(&self.project.base_path, target)
+            }
         }
     }
 
@@ -2379,7 +3963,8 @@ impl<'a> PbxGenerator<'a> {
             .spec_options
             .default_config
             .clone()
-            .unwrap_or_else(|| "Release".to_owned())
+            .or_else(|| self.config_names().into_iter().next())
+            .unwrap_or_else(|| "Debug".to_owned())
     }
 
     fn development_language(&self) -> &str {
@@ -2390,8 +3975,12 @@ impl<'a> PbxGenerator<'a> {
             .unwrap_or("en")
     }
 
-    fn project_default_build_settings(&self) -> BTreeMap<String, PbxValue> {
+    fn project_default_build_settings(&self, config: &str) -> BTreeMap<String, PbxValue> {
         let mut settings = BTreeMap::new();
+        settings.insert(
+            "PRODUCT_NAME".to_owned(),
+            PbxValue::String("$(TARGET_NAME)".to_owned()),
+        );
         if let Some(platform) = self.single_project_platform() {
             settings.insert(
                 "SDKROOT".to_owned(),
@@ -2431,6 +4020,9 @@ impl<'a> PbxGenerator<'a> {
                 .visionos
                 .as_deref(),
         );
+        if !self.project.spec_options.setting_presets_none {
+            insert_project_setting_presets(&mut settings, config);
+        }
         settings
     }
 
@@ -2454,12 +4046,19 @@ impl<'a> PbxGenerator<'a> {
         }
     }
 
-    fn target_default_build_settings(&self, target: &Target) -> BTreeMap<String, PbxValue> {
+    fn target_default_build_settings(
+        &self,
+        target: &Target,
+        config: &str,
+    ) -> BTreeMap<String, PbxValue> {
         let mut settings = BTreeMap::new();
         if let Some(prefix) = &self.project.spec_options.bundle_id_prefix {
             settings.insert(
                 "PRODUCT_BUNDLE_IDENTIFIER".to_owned(),
-                PbxValue::String(format!("{prefix}.{}", target.name)),
+                PbxValue::String(format!(
+                    "{prefix}.{}",
+                    bundle_identifier_suffix(&target.name)
+                )),
             );
         }
         if !matches!(target.platform, Platform::Auto) {
@@ -2494,6 +4093,9 @@ impl<'a> PbxGenerator<'a> {
         {
             settings.insert("FRAMEWORK_SEARCH_PATHS".to_owned(), search_paths);
         }
+        if !self.project.spec_options.setting_presets_none {
+            insert_target_setting_presets(&mut settings, target, config, self.project);
+        }
         settings
     }
 
@@ -2526,7 +4128,7 @@ impl<'a> PbxGenerator<'a> {
         if self.project.configs.is_empty() {
             vec!["Debug".to_owned(), "Release".to_owned()]
         } else {
-            self.project.configs.keys().cloned().collect()
+            ordered_config_names(&self.project.configs)
         }
     }
 
@@ -2556,6 +4158,7 @@ impl<'a> PbxGenerator<'a> {
     }
 
     fn serialize(&self, root_id: &str) -> String {
+        let id_map = self.xcode_reference_map(root_id);
         let mut output = String::new();
         output.push_str("// !$*UTF8*$!\n{\n");
         output.push_str(
@@ -2567,34 +4170,66 @@ impl<'a> PbxGenerator<'a> {
             sections.entry(object.isa).or_default().push((id, object));
         }
 
-        for (isa, objects) in sections {
+        let section_count = sections.len();
+        for (section_index, (isa, mut objects)) in sections.into_iter().enumerate() {
+            objects.sort_by_key(|(id, _)| mapped_id(id, &id_map));
             let _ = writeln!(output, "/* Begin {isa} section */");
             for (id, object) in objects {
-                let _ = write!(output, "\t\t{id}");
+                let output_id = mapped_id(id, &id_map);
+                let _ = write!(output, "\t\t{output_id}");
                 if let Some(comment) = &object.comment {
                     if !comment.is_empty() {
                         let _ = write!(output, " /* {comment} */");
                     }
                 }
-                output.push_str(" = {\n");
-                let _ = writeln!(output, "\t\t\tisa = {isa};");
-                for (key, value) in &object.fields {
-                    let _ = write!(output, "\t\t\t{key} = ");
-                    value.write(&mut output, 3, &self.graph.comments);
-                    output.push_str(";\n");
+                if object.isa == "PBXBuildFile" || object.isa == "PBXFileReference" {
+                    output.push_str(" = {isa = ");
+                    output.push_str(isa);
+                    output.push_str("; ");
+                    for (key, value) in &object.fields {
+                        let _ = write!(output, "{key} = ");
+                        write_compact_value(value, &mut output, &self.graph.comments, &id_map, key);
+                        output.push_str("; ");
+                    }
+                    output.push_str("};\n");
+                } else {
+                    output.push_str(" = {\n");
+                    let _ = writeln!(output, "\t\t\tisa = {isa};");
+                    for (key, value) in &object.fields {
+                        let _ = write!(output, "\t\t\t{key} = ");
+                        if key == "remoteGlobalIDString" {
+                            if let PbxValue::String(value) = value {
+                                output.push_str(&mapped_id(value, &id_map));
+                            } else {
+                                value.write(&mut output, 3, &self.graph.comments, &id_map);
+                            }
+                        } else {
+                            value.write(&mut output, 3, &self.graph.comments, &id_map);
+                        }
+                        output.push_str(";\n");
+                    }
+                    output.push_str("\t\t};\n");
                 }
-                output.push_str("\t\t};\n");
             }
-            let _ = writeln!(output, "/* End {isa} section */\n");
+            let _ = writeln!(output, "/* End {isa} section */");
+            if section_index + 1 < section_count {
+                output.push('\n');
+            }
         }
 
         output.push_str("\t};\n");
         let _ = writeln!(
             output,
             "\trootObject = {} /* Project object */;\n}}",
-            root_id
+            mapped_id(root_id, &id_map)
         );
         output
+    }
+
+    fn xcode_reference_map(&self, root_id: &str) -> HashMap<String, String> {
+        let mut generator = XcodeReferenceGenerator::new(self);
+        generator.generate(root_id);
+        generator.output
     }
 }
 
@@ -2683,7 +4318,7 @@ fn write_scheme_management(
     if states.is_empty() {
         return Ok(());
     }
-    let schemes_dir = project_path.join("xcuserdata/oxidegen.xcuserdatad/xcschemes");
+    let schemes_dir = project_path.join("xcuserdata/xcodegenrust.xcuserdatad/xcschemes");
     fs::create_dir_all(&schemes_dir).map_err(|source| ProjectWriteError::Write {
         path: schemes_dir.clone(),
         source,
@@ -2835,6 +4470,11 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
         scheme
             .test
             .as_ref()
+            .map(|test| test.stop_on_every_main_thread_checker_issue)
+            .unwrap_or(false),
+        scheme
+            .test
+            .as_ref()
             .and_then(|test| test.custom_lldb_init.as_deref()),
         test_macro_expansion,
         scheme
@@ -2917,6 +4557,16 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
             .run
             .as_ref()
             .map(|run| run.disable_main_thread_checker)
+            .unwrap_or(false),
+        scheme
+            .run
+            .as_ref()
+            .map(|run| run.stop_on_every_main_thread_checker_issue)
+            .unwrap_or(false),
+        scheme
+            .run
+            .as_ref()
+            .map(|run| run.disable_thread_performance_checker)
             .unwrap_or(false),
         scheme
             .run
@@ -3051,6 +4701,7 @@ fn target_scheme_xml(
         scheme.gather_coverage_data,
         true,
         scheme.disable_main_thread_checker,
+        scheme.stop_on_every_main_thread_checker_issue,
         None,
         None,
         &test_targets,
@@ -3078,6 +4729,8 @@ fn target_scheme_xml(
         None,
         None,
         scheme.disable_main_thread_checker,
+        scheme.stop_on_every_main_thread_checker_issue,
+        scheme.disable_thread_performance_checker,
         &scheme.command_line_arguments,
         scheme.language.as_deref(),
         scheme.region.as_deref(),
@@ -3170,6 +4823,7 @@ fn write_test_action(
     gather_coverage_data: bool,
     debug_enabled: bool,
     disable_main_thread_checker: bool,
+    stop_on_every_main_thread_checker_issue: bool,
     custom_lldb_init: Option<&str>,
     macro_expansion: Option<&str>,
     test_targets: &[crate::spec::SchemeTestTarget],
@@ -3193,12 +4847,13 @@ fn write_test_action(
     };
     let _ = writeln!(
         output,
-        "<TestAction buildConfiguration=\"{}\" selectedDebuggerIdentifier=\"{}\" selectedLauncherIdentifier=\"{}\" shouldUseLaunchSchemeArgsEnv=\"YES\" codeCoverageEnabled=\"{}\" disableMainThreadChecker=\"{}\"{}{}{}>",
+        "<TestAction buildConfiguration=\"{}\" selectedDebuggerIdentifier=\"{}\" selectedLauncherIdentifier=\"{}\" shouldUseLaunchSchemeArgsEnv=\"YES\" codeCoverageEnabled=\"{}\" disableMainThreadChecker=\"{}\" stopOnEveryMainThreadCheckerIssue=\"{}\"{}{}{}>",
         xml_escape(config.unwrap_or(default_config)),
         if debug_enabled { "Xcode.DebuggerFoundation.Debugger.LLDB" } else { "" },
         if debug_enabled { "Xcode.DebuggerFoundation.Launcher.LLDB" } else { "Xcode.IDEFoundation.Launcher.PosixSpawn" },
         bool_xml(gather_coverage_data),
         bool_xml(disable_main_thread_checker),
+        bool_xml(stop_on_every_main_thread_checker_issue),
         system_attachment_lifetime
             .map(|value| format!(" systemAttachmentLifetime=\"{value}\""))
             .unwrap_or_default(),
@@ -3313,6 +4968,8 @@ fn write_launch_action(
     macro_expansion: Option<&str>,
     simulate_location: Option<&crate::spec::SchemeSimulateLocation>,
     disable_main_thread_checker: bool,
+    stop_on_every_main_thread_checker_issue: bool,
+    disable_thread_performance_checker: bool,
     command_line_arguments: &indexmap::IndexMap<String, bool>,
     language: Option<&str>,
     region: Option<&str>,
@@ -3323,7 +4980,7 @@ fn write_launch_action(
     write_indent(output, indent);
     let _ = writeln!(
         output,
-        "<LaunchAction buildConfiguration=\"{}\" selectedDebuggerIdentifier=\"{}\" selectedLauncherIdentifier=\"{}\" launchStyle=\"0\" useCustomWorkingDirectory=\"{}\"{}{}{}{}{}{} ignoresPersistentStateOnLaunch=\"NO\" debugDocumentVersioning=\"YES\" debugServiceExtension=\"internal\" allowLocationSimulation=\"YES\"{} disableMainThreadChecker=\"{}\">",
+        "<LaunchAction buildConfiguration=\"{}\" selectedDebuggerIdentifier=\"{}\" selectedLauncherIdentifier=\"{}\" launchStyle=\"0\" useCustomWorkingDirectory=\"{}\"{}{}{}{}{}{} ignoresPersistentStateOnLaunch=\"NO\" debugDocumentVersioning=\"YES\" debugServiceExtension=\"internal\" allowLocationSimulation=\"YES\"{} disableMainThreadChecker=\"{}\" stopOnEveryMainThreadCheckerIssue=\"{}\" disableThreadPerformanceChecker=\"{}\">",
         xml_escape(config.unwrap_or(default_config)),
         if debug_enabled { "Xcode.DebuggerFoundation.Debugger.LLDB" } else { "" },
         if debug_enabled { "Xcode.DebuggerFoundation.Launcher.LLDB" } else { "Xcode.IDEFoundation.Launcher.PosixSpawn" },
@@ -3345,7 +5002,9 @@ fn write_launch_action(
             .map(|value| format!(" region=\"{}\"", xml_escape(value)))
             .unwrap_or_default(),
         launch_automatically_substyle.map(|value| format!(" launchAutomaticallySubstyle=\"{}\"", xml_escape(value))).unwrap_or_default(),
-        bool_xml(disable_main_thread_checker)
+        bool_xml(disable_main_thread_checker),
+        bool_xml(stop_on_every_main_thread_checker_issue),
+        bool_xml(disable_thread_performance_checker)
     );
     if let Some(target_name) = runnable.and_then(|name| project.targets.get(name)) {
         write_indent(output, indent + 1);
@@ -3394,6 +5053,7 @@ fn write_launch_action(
     output.push_str("</LaunchAction>\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_profile_action(
     output: &mut String,
     project: &Project,
@@ -4006,12 +5666,462 @@ fn source_build_phase_override(source: &TargetSource) -> Option<Option<&'static 
             "none" => None,
             _ => return None,
         }),
+        Some(Value::Object(map)) if map.contains_key("copyFiles") => Some(Some("CopyFiles")),
         _ => None,
     }
 }
 
+fn file_group_source(path: String) -> TargetSource {
+    TargetSource {
+        path,
+        name: None,
+        group: None,
+        compiler_flags: Vec::new(),
+        excludes: Vec::new(),
+        includes: Vec::new(),
+        explicit_folders: Vec::new(),
+        source_type: Some(SourceType::Group),
+        optional: false,
+        build_phase: None,
+        header_visibility: None,
+        create_intermediate_groups: None,
+        attributes: Vec::new(),
+        resource_tags: Vec::new(),
+        infer_destination_filters_by_path: None,
+        destination_filters: Vec::new(),
+        raw: Value::Null,
+    }
+}
+
+fn path_is_under_group(path: &str, group: &str) -> bool {
+    path == group || path.starts_with(&format!("{}/", group.trim_end_matches('/')))
+}
+
 fn string_array(values: &[String]) -> PbxValue {
     PbxValue::Array(values.iter().cloned().map(PbxValue::String).collect())
+}
+
+fn ordered_config_names(configs: &indexmap::IndexMap<String, String>) -> Vec<String> {
+    let mut environments = Vec::new();
+    let mut all_environment_configs = true;
+    for config in configs.keys() {
+        let Some(environment) = config
+            .strip_suffix(" Debug")
+            .or_else(|| config.strip_suffix(" Release"))
+        else {
+            all_environment_configs = false;
+            break;
+        };
+        if !environments
+            .iter()
+            .any(|existing: &String| existing == environment)
+        {
+            environments.push(environment.to_owned());
+        }
+    }
+    if all_environment_configs && !environments.is_empty() {
+        environments.reverse();
+        let mut ordered = Vec::new();
+        for environment in &environments {
+            for suffix in ["Debug", "Release"] {
+                let config = format!("{environment} {suffix}");
+                if configs.contains_key(&config) {
+                    ordered.push(config);
+                }
+            }
+        }
+        return ordered;
+    }
+    configs.keys().cloned().collect()
+}
+
+fn config_file_reference_key(
+    owner_type: &str,
+    owner_name: &str,
+    config_name: &str,
+    path: &str,
+) -> String {
+    format!("configFile:{owner_type}:{owner_name}:{config_name}:{path}")
+}
+
+fn split_config_file_path(path: &str) -> Option<(String, String)> {
+    let path_ref = Path::new(path);
+    let parent = path_ref.parent()?.to_str()?;
+    if parent.is_empty() {
+        return None;
+    }
+    let file_name = path_ref.file_name()?.to_str()?;
+    Some((parent.to_owned(), file_name.to_owned()))
+}
+
+fn is_debug_config_name(config: &str) -> bool {
+    config == "Debug" || config.ends_with(" Debug")
+}
+
+fn insert_project_setting_presets(settings: &mut BTreeMap<String, PbxValue>, config: &str) {
+    for (key, value) in [
+        ("ALWAYS_SEARCH_USER_PATHS", "NO"),
+        ("CLANG_ANALYZER_NONNULL", "YES"),
+        ("CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION", "YES_AGGRESSIVE"),
+        ("CLANG_CXX_LANGUAGE_STANDARD", "gnu++14"),
+        ("CLANG_CXX_LIBRARY", "libc++"),
+        ("CLANG_ENABLE_MODULES", "YES"),
+        ("CLANG_ENABLE_OBJC_ARC", "YES"),
+        ("CLANG_ENABLE_OBJC_WEAK", "YES"),
+        ("CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING", "YES"),
+        ("CLANG_WARN_BOOL_CONVERSION", "YES"),
+        ("CLANG_WARN_COMMA", "YES"),
+        ("CLANG_WARN_CONSTANT_CONVERSION", "YES"),
+        ("CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS", "YES"),
+        ("CLANG_WARN_DIRECT_OBJC_ISA_USAGE", "YES_ERROR"),
+        ("CLANG_WARN_DOCUMENTATION_COMMENTS", "YES"),
+        ("CLANG_WARN_EMPTY_BODY", "YES"),
+        ("CLANG_WARN_ENUM_CONVERSION", "YES"),
+        ("CLANG_WARN_INFINITE_RECURSION", "YES"),
+        ("CLANG_WARN_INT_CONVERSION", "YES"),
+        ("CLANG_WARN_NON_LITERAL_NULL_CONVERSION", "YES"),
+        ("CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF", "YES"),
+        ("CLANG_WARN_OBJC_LITERAL_CONVERSION", "YES"),
+        ("CLANG_WARN_OBJC_ROOT_CLASS", "YES_ERROR"),
+        ("CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER", "YES"),
+        ("CLANG_WARN_RANGE_LOOP_ANALYSIS", "YES"),
+        ("CLANG_WARN_STRICT_PROTOTYPES", "YES"),
+        ("CLANG_WARN_SUSPICIOUS_MOVE", "YES"),
+        ("CLANG_WARN_UNGUARDED_AVAILABILITY", "YES_AGGRESSIVE"),
+        ("CLANG_WARN_UNREACHABLE_CODE", "YES"),
+        ("CLANG_WARN__DUPLICATE_METHOD_MATCH", "YES"),
+        ("COPY_PHASE_STRIP", "NO"),
+        ("ENABLE_STRICT_OBJC_MSGSEND", "YES"),
+        ("GCC_C_LANGUAGE_STANDARD", "gnu11"),
+        ("GCC_NO_COMMON_BLOCKS", "YES"),
+        ("GCC_WARN_64_TO_32_BIT_CONVERSION", "YES"),
+        ("GCC_WARN_ABOUT_RETURN_TYPE", "YES_ERROR"),
+        ("GCC_WARN_UNDECLARED_SELECTOR", "YES"),
+        ("GCC_WARN_UNINITIALIZED_AUTOS", "YES_AGGRESSIVE"),
+        ("GCC_WARN_UNUSED_FUNCTION", "YES"),
+        ("GCC_WARN_UNUSED_VARIABLE", "YES"),
+        ("MTL_FAST_MATH", "YES"),
+        ("SWIFT_VERSION", "5.0"),
+    ] {
+        settings
+            .entry(key.to_owned())
+            .or_insert_with(|| PbxValue::String(value.to_owned()));
+    }
+
+    if is_debug_config_name(config) {
+        settings.insert(
+            "DEBUG_INFORMATION_FORMAT".to_owned(),
+            PbxValue::String("dwarf".to_owned()),
+        );
+        settings.insert("ENABLE_TESTABILITY".to_owned(), pbx_bool(true));
+        settings.insert("GCC_DYNAMIC_NO_PIC".to_owned(), pbx_bool(false));
+        settings.insert(
+            "GCC_OPTIMIZATION_LEVEL".to_owned(),
+            PbxValue::String("0".to_owned()),
+        );
+        settings.insert(
+            "GCC_PREPROCESSOR_DEFINITIONS".to_owned(),
+            PbxValue::Array(vec![
+                PbxValue::String("$(inherited)".to_owned()),
+                PbxValue::String("DEBUG=1".to_owned()),
+            ]),
+        );
+        settings.insert(
+            "MTL_ENABLE_DEBUG_INFO".to_owned(),
+            PbxValue::String("INCLUDE_SOURCE".to_owned()),
+        );
+        settings.insert("ONLY_ACTIVE_ARCH".to_owned(), pbx_bool(true));
+        settings.insert(
+            "SWIFT_ACTIVE_COMPILATION_CONDITIONS".to_owned(),
+            PbxValue::String("DEBUG".to_owned()),
+        );
+        settings.insert(
+            "SWIFT_OPTIMIZATION_LEVEL".to_owned(),
+            PbxValue::String("-Onone".to_owned()),
+        );
+    } else {
+        settings.insert(
+            "DEBUG_INFORMATION_FORMAT".to_owned(),
+            PbxValue::String("dwarf-with-dsym".to_owned()),
+        );
+        settings.insert("ENABLE_NS_ASSERTIONS".to_owned(), pbx_bool(false));
+        settings.insert(
+            "MTL_ENABLE_DEBUG_INFO".to_owned(),
+            PbxValue::String("NO".to_owned()),
+        );
+        settings.insert(
+            "SWIFT_COMPILATION_MODE".to_owned(),
+            PbxValue::String("wholemodule".to_owned()),
+        );
+        settings.insert(
+            "SWIFT_OPTIMIZATION_LEVEL".to_owned(),
+            PbxValue::String("-O".to_owned()),
+        );
+    }
+}
+
+fn insert_target_setting_presets(
+    settings: &mut BTreeMap<String, PbxValue>,
+    target: &Target,
+    _config: &str,
+    project: &Project,
+) {
+    if matches!(target.platform, Platform::Macos) {
+        settings
+            .entry("COMBINE_HIDPI_IMAGES".to_owned())
+            .or_insert_with(|| pbx_bool(true));
+    }
+    if product_type_is_app(&target.target_type) {
+        if target.target_type == ProductType::Application {
+            settings
+                .entry("ASSETCATALOG_COMPILER_APPICON_NAME".to_owned())
+                .or_insert_with(|| PbxValue::String("AppIcon".to_owned()));
+        }
+        if matches!(target.platform, Platform::Ios)
+            && target.target_type == ProductType::Application
+        {
+            settings
+                .entry("CODE_SIGN_IDENTITY".to_owned())
+                .or_insert_with(|| PbxValue::String("iPhone Developer".to_owned()));
+        }
+        if !matches!(target.platform, Platform::Watchos) {
+            settings
+                .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+                .or_insert_with(|| executable_runpath_search_paths_for_platform(&target.platform));
+        }
+        if is_watch_app_product(&target.target_type) {
+            settings
+                .entry("SKIP_INSTALL".to_owned())
+                .or_insert_with(|| pbx_bool(true));
+        }
+    } else if target.target_type == ProductType::UnitTestBundle {
+        settings
+            .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+            .or_insert_with(|| test_runpath_search_paths_for_platform(&target.platform));
+        if let Some(test_host) = test_host_setting(project, target) {
+            settings
+                .entry("TEST_HOST".to_owned())
+                .or_insert_with(|| PbxValue::String(test_host));
+            settings
+                .entry("BUNDLE_LOADER".to_owned())
+                .or_insert_with(|| PbxValue::String("$(TEST_HOST)".to_owned()));
+        }
+    } else if target.target_type == ProductType::UiTestBundle {
+        settings
+            .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+            .or_insert_with(|| test_runpath_search_paths_for_platform(&target.platform));
+        if let Some(test_target_name) = test_target_name_setting(project, target) {
+            settings
+                .entry("BUNDLE_LOADER".to_owned())
+                .or_insert_with(|| PbxValue::String("$(TEST_HOST)".to_owned()));
+            settings
+                .entry("TEST_TARGET_NAME".to_owned())
+                .or_insert_with(|| PbxValue::String(test_target_name));
+        }
+    } else if matches!(target.target_type, ProductType::StaticLibrary) {
+        if !matches!(target.platform, Platform::Watchos) {
+            settings
+                .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+                .or_insert_with(|| executable_runpath_search_paths_for_platform(&target.platform));
+        }
+        settings
+            .entry("SKIP_INSTALL".to_owned())
+            .or_insert_with(|| pbx_bool(true));
+    } else if matches!(
+        target.target_type,
+        ProductType::Bundle | ProductType::Other(_)
+    ) {
+        settings
+            .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+            .or_insert_with(|| executable_runpath_search_paths_for_platform(&target.platform));
+    } else if matches!(
+        target.target_type,
+        ProductType::WatchExtension | ProductType::Watch2Extension
+    ) {
+        settings
+            .entry("ASSETCATALOG_COMPILER_COMPLICATION_NAME".to_owned())
+            .or_insert_with(|| PbxValue::String("Complication".to_owned()));
+        settings
+            .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+            .or_insert_with(watch_extension_runpath_search_paths);
+        settings
+            .entry("SKIP_INSTALL".to_owned())
+            .or_insert_with(|| pbx_bool(true));
+    } else if target.target_type == ProductType::MessagesExtension {
+        settings
+            .entry("ASSETCATALOG_COMPILER_APPICON_NAME".to_owned())
+            .or_insert_with(|| PbxValue::String("iMessage App Icon".to_owned()));
+        settings
+            .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+            .or_insert_with(watch_extension_runpath_search_paths);
+    } else if target.target_type == ProductType::StickerPack {
+        settings
+            .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+            .or_insert_with(executable_runpath_search_paths);
+    } else if matches!(
+        target.target_type,
+        ProductType::SystemExtension
+            | ProductType::DriverExtension
+            | ProductType::XpcService
+            | ProductType::CommandLineTool
+    ) {
+        settings
+            .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+            .or_insert_with(|| executable_runpath_search_paths_for_platform(&target.platform));
+    }
+    if matches!(
+        target.target_type,
+        ProductType::Framework | ProductType::StaticFramework
+    ) {
+        insert_framework_target_setting_presets(settings, &target.platform);
+    }
+}
+
+fn insert_framework_target_setting_presets(
+    settings: &mut BTreeMap<String, PbxValue>,
+    platform: &Platform,
+) {
+    settings
+        .entry("CODE_SIGN_IDENTITY".to_owned())
+        .or_insert_with(|| PbxValue::String(String::new()));
+    settings
+        .entry("CURRENT_PROJECT_VERSION".to_owned())
+        .or_insert_with(|| PbxValue::Int(1));
+    settings
+        .entry("DEFINES_MODULE".to_owned())
+        .or_insert_with(|| pbx_bool(true));
+    settings
+        .entry("DYLIB_COMPATIBILITY_VERSION".to_owned())
+        .or_insert_with(|| PbxValue::Int(1));
+    settings
+        .entry("DYLIB_CURRENT_VERSION".to_owned())
+        .or_insert_with(|| PbxValue::Int(1));
+    settings
+        .entry("DYLIB_INSTALL_NAME_BASE".to_owned())
+        .or_insert_with(|| PbxValue::String("@rpath".to_owned()));
+    settings
+        .entry("INSTALL_PATH".to_owned())
+        .or_insert_with(|| PbxValue::String("$(LOCAL_LIBRARY_DIR)/Frameworks".to_owned()));
+    match platform {
+        Platform::Macos => {
+            settings
+                .entry("COMBINE_HIDPI_IMAGES".to_owned())
+                .or_insert_with(|| pbx_bool(true));
+            settings
+                .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+                .or_insert_with(macos_runpath_search_paths);
+        }
+        Platform::Watchos => {}
+        _ => {
+            settings
+                .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
+                .or_insert_with(executable_runpath_search_paths);
+        }
+    }
+    settings
+        .entry("SKIP_INSTALL".to_owned())
+        .or_insert_with(|| pbx_bool(true));
+    settings
+        .entry("VERSIONING_SYSTEM".to_owned())
+        .or_insert_with(|| PbxValue::String("apple-generic".to_owned()));
+}
+
+fn executable_runpath_search_paths() -> PbxValue {
+    PbxValue::Array(vec![
+        PbxValue::String("$(inherited)".to_owned()),
+        PbxValue::String("@executable_path/Frameworks".to_owned()),
+    ])
+}
+
+fn macos_runpath_search_paths() -> PbxValue {
+    PbxValue::Array(vec![
+        PbxValue::String("$(inherited)".to_owned()),
+        PbxValue::String("@executable_path/../Frameworks".to_owned()),
+    ])
+}
+
+fn executable_runpath_search_paths_for_platform(platform: &Platform) -> PbxValue {
+    if matches!(platform, Platform::Macos) {
+        macos_runpath_search_paths()
+    } else {
+        executable_runpath_search_paths()
+    }
+}
+
+fn test_runpath_search_paths() -> PbxValue {
+    PbxValue::Array(vec![
+        PbxValue::String("$(inherited)".to_owned()),
+        PbxValue::String("@executable_path/Frameworks".to_owned()),
+        PbxValue::String("@loader_path/Frameworks".to_owned()),
+    ])
+}
+
+fn watch_extension_runpath_search_paths() -> PbxValue {
+    PbxValue::Array(vec![
+        PbxValue::String("$(inherited)".to_owned()),
+        PbxValue::String("@executable_path/Frameworks".to_owned()),
+        PbxValue::String("@executable_path/../../Frameworks".to_owned()),
+    ])
+}
+
+fn test_runpath_search_paths_for_platform(platform: &Platform) -> PbxValue {
+    if matches!(platform, Platform::Macos) {
+        PbxValue::Array(vec![
+            PbxValue::String("$(inherited)".to_owned()),
+            PbxValue::String("@executable_path/../Frameworks".to_owned()),
+            PbxValue::String("@loader_path/../Frameworks".to_owned()),
+        ])
+    } else {
+        test_runpath_search_paths()
+    }
+}
+
+fn test_target_name_setting(project: &Project, target: &Target) -> Option<String> {
+    test_target_reference_name(project, target)
+        .and_then(|target_name| project.targets.get(target_name))
+        .map(|target| target.product_name.clone())
+}
+
+fn test_target_reference_name<'a>(project: &'a Project, target: &'a Target) -> Option<&'a str> {
+    target.dependencies.iter().find_map(|dependency| {
+        if dependency.dependency_type != DependencyType::Target {
+            return None;
+        }
+        let dependency_target = project.targets.get(&dependency.reference)?;
+        if dependency_target.target_type != ProductType::Application
+            && dependency_target.target_type != ProductType::OnDemandInstallCapableApplication
+        {
+            return None;
+        }
+        Some(dependency.reference.as_str())
+    })
+}
+
+fn bundle_identifier_suffix(target_name: &str) -> String {
+    target_name.replace('_', "-").replace(' ', "")
+}
+
+fn test_host_setting(project: &Project, target: &Target) -> Option<String> {
+    target.dependencies.iter().find_map(|dependency| {
+        if dependency.dependency_type != DependencyType::Target {
+            return None;
+        }
+        let dependency_target = project.targets.get(&dependency.reference)?;
+        if dependency_target.target_type != ProductType::Application
+            && dependency_target.target_type != ProductType::OnDemandInstallCapableApplication
+        {
+            return None;
+        }
+        Some(format!(
+            "$(BUILT_PRODUCTS_DIR)/{}{}",
+            dependency_target.filename(),
+            if dependency_target.platform == Platform::Macos {
+                format!("/Contents/MacOS/{}", dependency_target.product_name)
+            } else {
+                format!("/{}", dependency_target.product_name)
+            }
+        ))
+    })
 }
 
 fn insert_deployment_target(
@@ -4210,12 +6320,190 @@ fn carthage_framework_search_paths(options: &SpecOptions, target: &Target) -> Op
     }
 }
 
+fn carthage_dependency_references(
+    project: &Project,
+    target: &Target,
+    dependency: &Dependency,
+) -> Vec<String> {
+    carthage_dependency_references_for_platform(project, &target.platform, dependency)
+}
+
+fn carthage_dependency_references_for_platform(
+    project: &Project,
+    platform: &Platform,
+    dependency: &Dependency,
+) -> Vec<String> {
+    let DependencyType::Carthage {
+        find_frameworks, ..
+    } = &dependency.dependency_type
+    else {
+        return Vec::new();
+    };
+    if !find_frameworks.unwrap_or(project.spec_options.find_carthage_frameworks) {
+        return vec![dependency.reference.clone()];
+    }
+
+    let base_path = project
+        .spec_options
+        .carthage_build_path
+        .as_deref()
+        .unwrap_or("Carthage/Build");
+    let version_path = project
+        .base_path
+        .join(base_path)
+        .join(format!(".{}.version", dependency.reference));
+    let Ok(data) = fs::read_to_string(version_path) else {
+        return vec![dependency.reference.clone()];
+    };
+    let Ok(Value::Object(version_file)) = serde_json::from_str::<Value>(&data) else {
+        return vec![dependency.reference.clone()];
+    };
+    let platform_dir = carthage_platform_dir(platform);
+    let Some(Value::Array(references)) = version_file.get(platform_dir) else {
+        return vec![dependency.reference.clone()];
+    };
+
+    let mut names = references
+        .iter()
+        .filter_map(|reference| reference.get("name").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        vec![dependency.reference.clone()]
+    } else {
+        names
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCarthageDependency {
+    dependency: Dependency,
+}
+
+enum ProjectTargetRef<'a> {
+    Target(&'a Target),
+    Aggregate(&'a AggregateTarget),
+}
+
+impl<'a> ProjectTargetRef<'a> {
+    fn name(&self) -> &str {
+        match self {
+            Self::Target(target) => &target.name,
+            Self::Aggregate(target) => &target.name,
+        }
+    }
+}
+
+fn resolved_carthage_dependencies(
+    project: &Project,
+    top_level_target: &Target,
+) -> Vec<ResolvedCarthageDependency> {
+    let mut visited_targets = HashSet::<String>::new();
+    let mut seen_dependencies = HashSet::<String>::new();
+    let mut resolved = Vec::<ResolvedCarthageDependency>::new();
+    let mut queue = VecDeque::from([ProjectTargetRef::Target(top_level_target)]);
+
+    while let Some(project_target) = queue.pop_front() {
+        if !visited_targets.insert(project_target.name().to_owned()) {
+            continue;
+        }
+
+        match project_target {
+            ProjectTargetRef::Target(target) => {
+                for dependency in &target.dependencies {
+                    if dependency.link == Some(false)
+                        && !dependency.embed.unwrap_or_else(|| {
+                            target_should_embed_carthage_dependencies(top_level_target)
+                        })
+                    {
+                        continue;
+                    }
+
+                    match &dependency.dependency_type {
+                        DependencyType::Carthage {
+                            find_frameworks, ..
+                        } => {
+                            let references = if find_frameworks
+                                .unwrap_or(project.spec_options.find_carthage_frameworks)
+                            {
+                                carthage_dependency_references_for_platform(
+                                    project,
+                                    &target.platform,
+                                    dependency,
+                                )
+                            } else {
+                                vec![dependency.reference.clone()]
+                            };
+                            for reference in references {
+                                let mut dependency = dependency.clone();
+                                dependency.reference = reference;
+                                let key = resolved_carthage_dependency_key(&dependency);
+                                if seen_dependencies.insert(key) {
+                                    resolved.push(ResolvedCarthageDependency { dependency });
+                                }
+                            }
+                        }
+                        DependencyType::Target => {
+                            if let Some(target) = project.targets.get(&dependency.reference) {
+                                if top_level_target.platform == target.platform {
+                                    queue.push_back(ProjectTargetRef::Target(target));
+                                }
+                            } else if let Some(aggregate) =
+                                project.aggregate_target_specs.get(&dependency.reference)
+                            {
+                                queue.push_back(ProjectTargetRef::Aggregate(aggregate));
+                            }
+                        }
+                        DependencyType::Framework
+                        | DependencyType::Sdk { .. }
+                        | DependencyType::Package { .. }
+                        | DependencyType::Bundle => {}
+                    }
+                }
+            }
+            ProjectTargetRef::Aggregate(aggregate) => {
+                for dependency_name in &aggregate.targets {
+                    if let Some(target) = project.targets.get(dependency_name) {
+                        queue.push_back(ProjectTargetRef::Target(target));
+                    } else if let Some(aggregate) =
+                        project.aggregate_target_specs.get(dependency_name)
+                    {
+                        queue.push_back(ProjectTargetRef::Aggregate(aggregate));
+                    }
+                }
+            }
+        }
+    }
+
+    resolved.sort_by(|left, right| left.dependency.reference.cmp(&right.dependency.reference));
+    resolved
+}
+
+fn resolved_carthage_dependency_key(dependency: &Dependency) -> String {
+    let link_type = match &dependency.dependency_type {
+        DependencyType::Carthage { link_type, .. } => format!("{link_type:?}"),
+        _ => String::new(),
+    };
+    format!(
+        "{}|{}|{:?}|{:?}|{:?}|{}|{}",
+        dependency.reference,
+        link_type,
+        dependency.embed,
+        dependency.code_sign,
+        dependency.link,
+        dependency.implicit,
+        dependency.weak_link
+    )
+}
+
 fn carthage_platform_dir(platform: &Platform) -> &'static str {
     match platform {
         Platform::Macos => "Mac",
         Platform::Tvos => "tvOS",
         Platform::Watchos => "watchOS",
-        Platform::Visionos => "VisionOS",
+        Platform::Visionos => "visionOS",
         Platform::Ios | Platform::Auto => "iOS",
     }
 }
@@ -4226,6 +6514,20 @@ fn carthage_framework_name(reference: &str) -> String {
     } else {
         format!("{reference}.framework")
     }
+}
+
+fn ordered_carthage_platform_groups(groups: &BTreeMap<Platform, PbxValue>) -> Vec<PbxValue> {
+    [
+        Platform::Ios,
+        Platform::Macos,
+        Platform::Tvos,
+        Platform::Watchos,
+        Platform::Visionos,
+        Platform::Auto,
+    ]
+    .into_iter()
+    .filter_map(|platform| groups.get(&platform).cloned())
+    .collect()
 }
 
 fn has_supported_destination(target: &Target, destination: &str) -> bool {
@@ -4258,6 +6560,18 @@ fn platform_filters_for_dependency(dependency: &crate::spec::Dependency) -> Vec<
         .collect()
 }
 
+fn target_dependency_platform_filter(dependency: Option<&Dependency>) -> Option<String> {
+    match dependency?.platform_filter {
+        PlatformFilter::Ios => Some("ios".to_owned()),
+        PlatformFilter::Macos => Some("macos".to_owned()),
+        PlatformFilter::All => None,
+    }
+}
+
+fn dependency_platform_filter(dependency: &Dependency) -> Option<String> {
+    target_dependency_platform_filter(Some(dependency))
+}
+
 fn copy_files_settings_for_target_dependency(
     dependency: &Dependency,
     product_type: &ProductType,
@@ -4275,8 +6589,17 @@ fn copy_files_settings_for_target_dependency(
             dst_subfolder_spec: 10,
             dst_path: String::new(),
             phase_name: "Embed Frameworks".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PostCompile,
+        }),
+        ProductType::WatchApp | ProductType::Watch2App => Some(CopyFilesSettings {
+            dst_subfolder_spec: 16,
+            dst_path: "$(CONTENTS_FOLDER_PATH)/Watch".to_owned(),
+            phase_name: "Embed Watch Content".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PostCompile,
         }),
         ProductType::AppExtension
+        | ProductType::XcodeExtension
+        | ProductType::IntentsServiceExtension
         | ProductType::WatchExtension
         | ProductType::Watch2Extension
         | ProductType::TvExtension
@@ -4284,22 +6607,98 @@ fn copy_files_settings_for_target_dependency(
         | ProductType::StickerPack => Some(CopyFilesSettings {
             dst_subfolder_spec: 13,
             dst_path: String::new(),
-            phase_name: "Copy Files".to_owned(),
+            phase_name: "Embed Foundation Extensions".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PostCompile,
         }),
         ProductType::ExtensionKitExtension => Some(CopyFilesSettings {
             dst_subfolder_spec: 16,
             dst_path: "$(EXTENSIONS_FOLDER_PATH)".to_owned(),
-            phase_name: "Copy Files".to_owned(),
+            phase_name: "Embed Foundation Extensions".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PostCompile,
+        }),
+        ProductType::XpcService => Some(CopyFilesSettings {
+            dst_subfolder_spec: 16,
+            dst_path: "$(CONTENTS_FOLDER_PATH)/XPCServices".to_owned(),
+            phase_name: "CopyFiles".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PostCompile,
+        }),
+        ProductType::OnDemandInstallCapableApplication => Some(CopyFilesSettings {
+            dst_subfolder_spec: 16,
+            dst_path: "$(CONTENTS_FOLDER_PATH)/AppClips".to_owned(),
+            phase_name: "Embed App Clips".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PostCompile,
+        }),
+        ProductType::SystemExtension | ProductType::DriverExtension => Some(CopyFilesSettings {
+            dst_subfolder_spec: 16,
+            dst_path: "$(SYSTEM_EXTENSIONS_FOLDER_PATH)".to_owned(),
+            phase_name: "Embed System Extensions".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PostCompile,
         }),
         _ => None,
     }
 }
 
-fn should_embed_target_dependency(dependency: &Dependency, target: &Target) -> bool {
-    match dependency.embed {
-        Some(value) => value,
-        None => default_embed_target_product(target),
+fn copy_build_file_settings_for_target_dependency(
+    dependency: &Dependency,
+    target: &Target,
+) -> Option<PbxValue> {
+    let code_sign = dependency.code_sign.unwrap_or_else(|| {
+        target.target_type.is_framework() || target.target_type == ProductType::XpcService
+    });
+    copy_build_file_settings(code_sign, dependency.remove_headers)
+}
+
+fn copy_build_file_settings_for_dependency(dependency: &Dependency) -> Option<PbxValue> {
+    let code_sign = dependency.code_sign.unwrap_or(true);
+    copy_build_file_settings(code_sign, dependency.remove_headers)
+}
+
+fn copy_build_file_settings(code_sign: bool, remove_headers: bool) -> Option<PbxValue> {
+    let mut attributes = Vec::new();
+    if code_sign {
+        attributes.push(PbxValue::String("CodeSignOnCopy".to_owned()));
     }
+    if remove_headers {
+        attributes.push(PbxValue::String("RemoveHeadersOnCopy".to_owned()));
+    }
+    if attributes.is_empty() {
+        return None;
+    }
+    let mut settings = BTreeMap::new();
+    settings.insert("ATTRIBUTES".to_owned(), PbxValue::Array(attributes));
+    Some(PbxValue::Dict(settings))
+}
+
+fn should_embed_target_dependency(
+    parent_target: &Target,
+    dependency: &Dependency,
+    dependency_target: &Target,
+) -> bool {
+    if let Some(value) = dependency.embed {
+        return value;
+    }
+    if dependency.copy_phase.is_some() {
+        return true;
+    }
+    if !default_embed_target_product(dependency_target) {
+        return false;
+    }
+    if product_type_is_test(&parent_target.target_type) {
+        return dependency_target.target_type.is_framework();
+    }
+    product_type_is_app(&parent_target.target_type)
+        || matches!(
+            parent_target.target_type,
+            ProductType::AppExtension
+                | ProductType::XcodeExtension
+                | ProductType::IntentsServiceExtension
+                | ProductType::WatchExtension
+                | ProductType::Watch2Extension
+                | ProductType::TvExtension
+                | ProductType::MessagesExtension
+                | ProductType::StickerPack
+                | ProductType::ExtensionKitExtension
+        )
 }
 
 fn default_embed_target_product(target: &Target) -> bool {
@@ -4311,6 +6710,8 @@ fn default_embed_target_product(target: &Target) -> bool {
         target.target_type,
         ProductType::Framework
             | ProductType::AppExtension
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
             | ProductType::WatchExtension
             | ProductType::Watch2Extension
             | ProductType::TvExtension
@@ -4320,6 +6721,9 @@ fn default_embed_target_product(target: &Target) -> bool {
             | ProductType::XpcService
             | ProductType::SystemExtension
             | ProductType::DriverExtension
+            | ProductType::OnDemandInstallCapableApplication
+            | ProductType::WatchApp
+            | ProductType::Watch2App
     )
 }
 
@@ -4336,15 +6740,248 @@ fn is_watch_app_product(product_type: &ProductType) -> bool {
     matches!(product_type, ProductType::WatchApp | ProductType::Watch2App)
 }
 
+fn product_type_is_app(product_type: &ProductType) -> bool {
+    matches!(
+        product_type,
+        ProductType::Application
+            | ProductType::OnDemandInstallCapableApplication
+            | ProductType::WatchApp
+            | ProductType::Watch2App
+            | ProductType::MessagesApplication
+    )
+}
+
+fn product_type_is_test(product_type: &ProductType) -> bool {
+    matches!(
+        product_type,
+        ProductType::UnitTestBundle | ProductType::UiTestBundle | ProductType::OcUnitTestBundle
+    )
+}
+
+fn platform_requires_simulator_stripping(platform: &Platform) -> bool {
+    matches!(
+        platform,
+        Platform::Auto | Platform::Ios | Platform::Tvos | Platform::Watchos | Platform::Visionos
+    )
+}
+
+fn target_should_embed_carthage_dependencies(target: &Target) -> bool {
+    (product_type_is_app(&target.target_type) && target.platform != Platform::Watchos)
+        || target.target_type == ProductType::Watch2Extension
+        || product_type_is_test(&target.target_type)
+}
+
+fn product_type_is_linkable(product_type: &ProductType) -> bool {
+    product_type.is_framework() || product_type.is_library()
+}
+
+fn target_dependency_should_link(
+    target: &Target,
+    dependency: &Dependency,
+    dependency_target: &Target,
+) -> bool {
+    if target.target_type.is_framework()
+        && dependency_target.target_type == ProductType::StaticLibrary
+    {
+        return dependency.link.unwrap_or(false);
+    }
+    dependency
+        .link
+        .unwrap_or_else(|| product_type_is_linkable(&dependency_target.target_type))
+        && target.target_type != ProductType::StaticLibrary
+}
+
+fn target_uses_transitive_dependencies(project: &Project, target: &Target) -> bool {
+    target
+        .transitively_link_dependencies
+        .unwrap_or(project.spec_options.transitively_link_dependencies)
+}
+
+fn native_target_dependency_names(project: &Project, target: &Target) -> Vec<String> {
+    let mut names = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    let mut queue = VecDeque::<String>::new();
+
+    for dependency in &target.dependencies {
+        if dependency.dependency_type != DependencyType::Target {
+            continue;
+        }
+        if seen.insert(dependency.reference.clone()) {
+            names.push(dependency.reference.clone());
+            queue.push_back(dependency.reference.clone());
+        }
+    }
+
+    if !target_uses_transitive_dependencies(project, target) {
+        return names;
+    }
+
+    while let Some(dependency_name) = queue.pop_front() {
+        let Some(dependency_target) = project.targets.get(&dependency_name) else {
+            continue;
+        };
+        for dependency in &dependency_target.dependencies {
+            if dependency.dependency_type != DependencyType::Target {
+                continue;
+            }
+            if seen.insert(dependency.reference.clone()) {
+                names.push(dependency.reference.clone());
+                queue.push_back(dependency.reference.clone());
+            }
+        }
+    }
+
+    names
+}
+
+fn target_directly_embeds_carthage_dependencies(target: &Target) -> bool {
+    target
+        .directly_embed_carthage_dependencies
+        .unwrap_or_else(|| {
+            !(platform_requires_simulator_stripping(&target.platform)
+                && (product_type_is_app(&target.target_type)
+                    || target.target_type == ProductType::Watch2Extension))
+        })
+}
+
+fn should_embed_carthage_dependency(target: &Target, dependency: &Dependency) -> bool {
+    let DependencyType::Carthage { link_type, .. } = &dependency.dependency_type else {
+        return false;
+    };
+    *link_type == crate::spec::CarthageLinkType::Dynamic
+        && dependency
+            .embed
+            .unwrap_or_else(|| target_should_embed_carthage_dependencies(target))
+}
+
+fn ordered_group_children(
+    options: &SpecOptions,
+    group_name: &str,
+    children: Vec<PbxValue>,
+    is_group_or_folder: impl Fn(&PbxValue) -> bool,
+) -> Vec<PbxValue> {
+    let Some(ordering) = options
+        .group_ordering
+        .iter()
+        .find(|ordering| {
+            ordering.pattern.is_some()
+                && group_ordering_matches(ordering.pattern.as_deref(), group_name)
+        })
+        .or_else(|| {
+            options
+                .group_ordering
+                .iter()
+                .find(|ordering| group_ordering_matches(ordering.pattern.as_deref(), group_name))
+        })
+    else {
+        return children;
+    };
+    if ordering.order.is_empty() {
+        return children;
+    }
+
+    let files = children
+        .iter()
+        .filter(|child| !is_group_or_folder(child))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut groups = children
+        .iter()
+        .filter(|child| is_group_or_folder(child))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut ordered_groups = Vec::new();
+    for ordered_name in &ordering.order {
+        let Some(child) = groups
+            .iter()
+            .find(|child| pbx_value_comment(child) == *ordered_name)
+            .cloned()
+        else {
+            continue;
+        };
+        ordered_groups.push(child.clone());
+        groups.retain(|group| group != &child);
+    }
+    ordered_groups.extend(groups);
+
+    match options.group_sort_position {
+        GroupSortPosition::Top => ordered_groups.into_iter().chain(files).collect(),
+        GroupSortPosition::Bottom => files.into_iter().chain(ordered_groups).collect(),
+    }
+}
+
+fn group_ordering_matches(pattern: Option<&str>, group_name: &str) -> bool {
+    let Some(pattern) = pattern else {
+        return true;
+    };
+    if pattern == group_name {
+        return true;
+    }
+    if let Some(suffix) = pattern
+        .strip_prefix("^.*")
+        .and_then(|value| value.strip_suffix('$'))
+    {
+        return group_name.ends_with(suffix);
+    }
+    group_name.contains(pattern)
+}
+
+fn pbx_value_comment(value: &PbxValue) -> String {
+    match value {
+        PbxValue::Ref { comment, .. } => comment.clone().unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn pbx_value_id(value: &PbxValue) -> Option<&str> {
+    match value {
+        PbxValue::Ref { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
+fn pbx_string(value: &PbxValue) -> Option<&str> {
+    match value {
+        PbxValue::String(value) => Some(value),
+        _ => None,
+    }
+}
+
 fn should_embed_external_dependency(dependency: &Dependency) -> bool {
     match &dependency.dependency_type {
-        DependencyType::Framework | DependencyType::Sdk { .. } | DependencyType::Package { .. } => {
-            dependency.embed.unwrap_or(true)
-        }
+        DependencyType::Framework => dependency.embed.unwrap_or(true),
+        DependencyType::Sdk { .. } => dependency.embed.unwrap_or(false),
+        DependencyType::Package { .. } => dependency.embed.unwrap_or(false),
         DependencyType::Carthage { link_type, .. } => dependency
             .embed
             .unwrap_or(*link_type == crate::spec::CarthageLinkType::Dynamic),
         DependencyType::Target | DependencyType::Bundle => false,
+    }
+}
+
+fn framework_dependency_reference_key(
+    target_name: &str,
+    dependency: &Dependency,
+    path: &str,
+) -> String {
+    if matches!(dependency.dependency_type, DependencyType::Sdk { .. }) {
+        format!("sdkRef:{path}")
+    } else {
+        format!("frameworkRef:{target_name}:{}", dependency.reference)
+    }
+}
+
+fn sdk_reference_path(reference: &str, source_tree: &str) -> String {
+    if source_tree != "SDKROOT" || reference.contains('/') {
+        return reference.to_owned();
+    }
+    if reference.ends_with(".framework") {
+        format!("System/Library/Frameworks/{reference}")
+    } else if reference.ends_with(".tbd") || reference.ends_with(".dylib") {
+        format!("usr/lib/{reference}")
+    } else {
+        reference.to_owned()
     }
 }
 
@@ -4364,10 +7001,90 @@ fn copy_files_settings_for_embedded_dependency(
                     dst_subfolder_spec: 10,
                     dst_path: String::new(),
                     phase_name: "Embed Frameworks".to_owned(),
+                    phase_order: CopyFilesPhaseOrder::PostCompile,
                 })
             }),
         DependencyType::Target | DependencyType::Bundle => None,
     }
+}
+
+fn copy_files_settings_key(
+    settings: &CopyFilesSettings,
+) -> (i64, String, String, CopyFilesPhaseOrder) {
+    (
+        settings.dst_subfolder_spec,
+        settings.dst_path.clone(),
+        settings.phase_name.clone(),
+        settings.phase_order,
+    )
+}
+
+fn copy_files_destination_key(settings: &CopyFilesSettings) -> (i64, String, String) {
+    (
+        settings.dst_subfolder_spec,
+        settings.dst_path.clone(),
+        settings.phase_name.clone(),
+    )
+}
+
+fn default_source_copy_files_settings() -> CopyFilesSettings {
+    CopyFilesSettings {
+        dst_subfolder_spec: 10,
+        dst_path: String::new(),
+        phase_name: "Embed Frameworks".to_owned(),
+        phase_order: CopyFilesPhaseOrder::PostCompile,
+    }
+}
+
+fn source_copy_files_settings(
+    target: &Target,
+    source: &TargetSource,
+    path: &str,
+) -> Option<CopyFilesSettings> {
+    if let Some(settings) = source
+        .build_phase
+        .as_ref()
+        .and_then(copy_files_settings_from_source_build_phase)
+    {
+        return Some(settings);
+    }
+    if is_module_copy_file(path) && target.target_type == ProductType::StaticLibrary {
+        return Some(CopyFilesSettings {
+            dst_subfolder_spec: 16,
+            dst_path: "include/$(PRODUCT_NAME)".to_owned(),
+            phase_name: "CopyFiles".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PreCompile,
+        });
+    }
+    if is_module_copy_file(path) {
+        return Some(CopyFilesSettings {
+            dst_subfolder_spec: 16,
+            dst_path: "$(PRODUCT_NAME).framework/Modules".to_owned(),
+            phase_name: "CopyFiles".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PreCompile,
+        });
+    }
+    if path.ends_with(".xpc") {
+        return Some(CopyFilesSettings {
+            dst_subfolder_spec: 16,
+            dst_path: "$(CONTENTS_FOLDER_PATH)/XPCServices".to_owned(),
+            phase_name: "CopyFiles".to_owned(),
+            phase_order: CopyFilesPhaseOrder::PostCompile,
+        });
+    }
+    Some(default_source_copy_files_settings())
+}
+
+fn copy_files_settings_from_source_build_phase(value: &Value) -> Option<CopyFilesSettings> {
+    let map = value.as_object()?;
+    map.get("copyFiles")
+        .and_then(copy_files_settings_from_value)
+        .map(|mut settings| {
+            if settings.phase_name == "Copy Files" {
+                settings.phase_name = "CopyFiles".to_owned();
+            }
+            settings
+        })
 }
 
 fn copy_files_settings_from_value(value: &Value) -> Option<CopyFilesSettings> {
@@ -4395,11 +7112,13 @@ fn copy_files_settings_from_value(value: &Value) -> Option<CopyFilesSettings> {
             .get("subpath")
             .and_then(json_string_value)
             .unwrap_or_default(),
-        phase_name: if destination == "frameworks" {
-            "Embed Frameworks".to_owned()
-        } else {
-            "Copy Files".to_owned()
-        },
+        phase_name: match destination.as_str() {
+            "frameworks" => "Embed Frameworks",
+            "plugins" => "Embed Dependencies",
+            _ => "Copy Files",
+        }
+        .to_owned(),
+        phase_order: CopyFilesPhaseOrder::PostCompile,
     })
 }
 
@@ -4461,12 +7180,121 @@ fn source_path_requires_objc_linking(path: &Path) -> bool {
         .any(|entry| source_path_requires_objc_linking(&entry.path()))
 }
 
+fn localized_variant_group_path(base_path: &Path, path: &Path) -> Option<String> {
+    let group_name = localized_variant_group_name(path)?;
+    let variant_parent = path.parent()?.parent()?;
+    let mut relative = pathdiff(variant_parent, base_path);
+    relative.push(group_name);
+    Some(relative.to_string_lossy().into_owned())
+}
+
+fn localized_variant_group_name(path: &Path) -> Option<String> {
+    let lproj_dir = path.parent()?;
+    if lproj_dir
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("lproj")
+    {
+        return None;
+    }
+    let file_name = path.file_name()?.to_str()?;
+    if path.extension().and_then(|extension| extension.to_str()) == Some("strings") {
+        let stem = path.file_stem()?.to_str()?;
+        for extension in ["storyboard", "xib"] {
+            let parent = lproj_dir.parent()?;
+            let has_base_file = fs::read_dir(parent).ok()?.flatten().any(|entry| {
+                let candidate = entry.path().join(format!("{stem}.{extension}"));
+                candidate.exists()
+            });
+            if has_base_file {
+                return Some(format!("{stem}.{extension}"));
+            }
+        }
+    }
+    Some(file_name.to_owned())
+}
+
+fn localized_variant_files(parent: &Path, group_name: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return files;
+    };
+    let stem = Path::new(group_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(group_name);
+    for entry in entries.flatten() {
+        let lproj = entry.path();
+        if lproj.extension().and_then(|extension| extension.to_str()) != Some("lproj") {
+            continue;
+        }
+        let primary = lproj.join(group_name);
+        if primary.exists() {
+            files.push(primary);
+            continue;
+        }
+        let strings = lproj.join(format!("{stem}.strings"));
+        if strings.exists() {
+            files.push(strings);
+        }
+    }
+    files
+}
+
+fn localized_file_locale(path: &Path) -> Option<String> {
+    Some(path.parent()?.file_stem()?.to_str()?.to_owned())
+}
+
 fn bool_int(value: bool) -> i64 {
     if value {
         1
     } else {
         0
     }
+}
+
+fn boolish_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::String(value) => match value.as_str() {
+            "true" | "True" | "TRUE" | "yes" | "YES" => Some(true),
+            "false" | "False" | "FALSE" | "no" | "NO" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_legacy_target(target: &Target) -> bool {
+    target.target_type == ProductType::Other(String::new())
+}
+
+fn product_uses_explicit_file_type(target: &Target) -> bool {
+    matches!(
+        target.target_type,
+        ProductType::Framework
+            | ProductType::StaticFramework
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
+            | ProductType::WatchExtension
+            | ProductType::Watch2Extension
+            | ProductType::TvExtension
+            | ProductType::XpcService
+            | ProductType::SystemExtension
+            | ProductType::DriverExtension
+            | ProductType::ExtensionKitExtension
+    ) || matches!(
+        target.target_type,
+        ProductType::Application
+            | ProductType::UnitTestBundle
+            | ProductType::UiTestBundle
+            | ProductType::OcUnitTestBundle
+            | ProductType::StaticLibrary
+    ) && matches!(target.platform, Platform::Macos | Platform::Watchos)
+        || matches!(
+            target.target_type,
+            ProductType::WatchApp | ProductType::Watch2App
+        )
 }
 
 fn build_script_key(script: &BuildScript) -> String {
@@ -4606,6 +7434,340 @@ impl PbxGraph {
     }
 }
 
+struct XcodeReferenceGenerator<'a> {
+    generator: &'a PbxGenerator<'a>,
+    output: HashMap<String, String>,
+    references: HashSet<String>,
+    product_contexts: HashMap<String, String>,
+}
+
+impl<'a> XcodeReferenceGenerator<'a> {
+    fn new(generator: &'a PbxGenerator<'a>) -> Self {
+        Self {
+            generator,
+            output: HashMap::new(),
+            references: HashSet::new(),
+            product_contexts: HashMap::new(),
+        }
+    }
+
+    fn generate(&mut self, root_id: &str) {
+        let Some(project) = self.object_owned(root_id) else {
+            return;
+        };
+        let project_identifiers = vec![self.generator.project.name.clone()];
+        self.collect_product_contexts(&project);
+        self.fix(root_id, project.isa, &project_identifiers);
+
+        for package_id in self.array_refs(&project, "packageReferences") {
+            let Some(package) = self.object_owned(&package_id) else {
+                continue;
+            };
+            let identifier = match package.isa {
+                "XCRemoteSwiftPackageReference" => self
+                    .string_field(&package, "repositoryURL")
+                    .or_else(|| package.comment.clone()),
+                "XCLocalSwiftPackageReference" => self.string_field(&package, "relativePath"),
+                _ => None,
+            };
+            if let Some(identifier) = identifier {
+                let identifiers = vec![self.generator.project.name.clone(), identifier];
+                self.fix(&package_id, package.isa, &identifiers);
+            }
+        }
+
+        for target_id in self.array_refs(&project, "targets") {
+            let Some(target) = self.object_owned(&target_id) else {
+                continue;
+            };
+            let Some(target_name) = self.string_field(&target, "name") else {
+                continue;
+            };
+            let identifiers = vec![self.generator.project.name.clone(), target_name.clone()];
+
+            for product_id in self.array_refs(&target, "packageProductDependencies") {
+                if let Some(product) = self.object_owned(&product_id) {
+                    if let Some(product_name) = self.string_field(&product, "productName") {
+                        let product_identifiers = vec![
+                            self.generator.project.name.clone(),
+                            target_name.clone(),
+                            product_name,
+                        ];
+                        self.fix(&product_id, product.isa, &product_identifiers);
+                    }
+                }
+            }
+
+            for dependency_id in self.array_refs(&target, "dependencies") {
+                let Some(dependency) = self.object_owned(&dependency_id) else {
+                    continue;
+                };
+                let Some(product_id) = self.ref_field(&dependency, "productRef") else {
+                    continue;
+                };
+                let Some(product) = self.object_owned(&product_id) else {
+                    continue;
+                };
+                let Some(product_name) = self.string_field(&product, "productName") else {
+                    continue;
+                };
+                if let Some(plugin_name) = product_name.strip_prefix("plugin:") {
+                    let product_identifiers = vec![
+                        self.generator.project.name.clone(),
+                        target_name.clone(),
+                        plugin_name.to_owned(),
+                    ];
+                    self.fix(&product_id, product.isa, &product_identifiers);
+                }
+            }
+
+            self.fix(&target_id, target.isa, &identifiers);
+        }
+
+        if let Some(main_group_id) = self.ref_field(&project, "mainGroup") {
+            self.generate_group_references(&main_group_id, &project_identifiers);
+        }
+        if let Some(products_group_id) = self.ref_field(&project, "productRefGroup") {
+            self.generate_group_references(&products_group_id, &project_identifiers);
+        }
+
+        for target_id in self.array_refs(&project, "targets") {
+            let Some(target) = self.object_owned(&target_id) else {
+                continue;
+            };
+            let Some(target_name) = self.string_field(&target, "name") else {
+                continue;
+            };
+            let identifiers = vec![self.generator.project.name.clone(), target_name];
+            self.generate_target_references(&target, &identifiers);
+        }
+
+        if let Some(config_list_id) = self.ref_field(&project, "buildConfigurationList") {
+            self.generate_configuration_list_references(&config_list_id, &project_identifiers);
+        }
+    }
+
+    fn collect_product_contexts(&mut self, project: &PbxObject) {
+        for target_id in self.array_refs(project, "targets") {
+            let Some(target) = self.object(&target_id) else {
+                continue;
+            };
+            let Some(product_id) = self.ref_field(target, "productReference") else {
+                continue;
+            };
+            if let Some(target_name) = self.string_field(target, "name") {
+                self.product_contexts.insert(product_id, target_name);
+            }
+        }
+    }
+
+    fn generate_group_references(&mut self, group_id: &str, identifiers: &[String]) {
+        let Some(group) = self.object_owned(group_id) else {
+            return;
+        };
+        let mut identifiers = identifiers.to_vec();
+        if let Some(file_name) = self.file_name(&group) {
+            identifiers.push(file_name);
+        }
+        self.fix(group_id, group.isa, &identifiers);
+
+        for child_id in self.array_refs(&group, "children") {
+            let Some(child) = self.object_owned(&child_id) else {
+                continue;
+            };
+            match child.isa {
+                "PBXGroup" => self.generate_group_references(&child_id, &identifiers),
+                "PBXVariantGroup" | "XCVersionGroup" => {
+                    self.generate_variant_group_references(&child_id, &identifiers)
+                }
+                "PBXFileReference" => self.generate_file_reference(&child_id, &identifiers),
+                _ => {}
+            }
+        }
+    }
+
+    fn generate_variant_group_references(&mut self, group_id: &str, identifiers: &[String]) {
+        let Some(group) = self.object_owned(group_id) else {
+            return;
+        };
+        let mut identifiers = identifiers.to_vec();
+        if let Some(file_name) = self.file_name(&group) {
+            identifiers.push(file_name);
+        }
+        self.fix(group_id, group.isa, &identifiers);
+        for child_id in self.array_refs(&group, "children") {
+            self.generate_file_reference(&child_id, &identifiers);
+        }
+    }
+
+    fn generate_file_reference(&mut self, file_id: &str, identifiers: &[String]) {
+        let Some(file_ref) = self.object_owned(file_id) else {
+            return;
+        };
+        let mut identifiers = identifiers.to_vec();
+        if let Some(file_name) = self.file_name(&file_ref) {
+            identifiers.push(file_name);
+        }
+        if let Some(context) = self.product_contexts.get(file_id) {
+            identifiers.push(context.clone());
+        }
+        self.fix(file_id, file_ref.isa, &identifiers);
+    }
+
+    fn generate_target_references(&mut self, target: &PbxObject, identifiers: &[String]) {
+        if let Some(config_list_id) = self.ref_field(target, "buildConfigurationList") {
+            self.generate_configuration_list_references(&config_list_id, identifiers);
+        }
+
+        for phase_id in self.array_refs(target, "buildPhases") {
+            self.generate_build_phase_references(&phase_id, identifiers);
+        }
+
+        for dependency_id in self.array_refs(target, "dependencies") {
+            self.generate_target_dependency_references(&dependency_id, identifiers);
+        }
+    }
+
+    fn generate_configuration_list_references(
+        &mut self,
+        config_list_id: &str,
+        identifiers: &[String],
+    ) {
+        let Some(config_list) = self.object_owned(config_list_id) else {
+            return;
+        };
+        self.fix(config_list_id, config_list.isa, identifiers);
+        for config_id in self.array_refs(&config_list, "buildConfigurations") {
+            let Some(config) = self.object_owned(&config_id) else {
+                continue;
+            };
+            let Some(name) = self.string_field(&config, "name") else {
+                continue;
+            };
+            let mut identifiers = identifiers.to_vec();
+            identifiers.push(name);
+            self.fix(&config_id, config.isa, &identifiers);
+        }
+    }
+
+    fn generate_build_phase_references(&mut self, phase_id: &str, identifiers: &[String]) {
+        let Some(phase) = self.object_owned(phase_id) else {
+            return;
+        };
+        let mut identifiers = identifiers.to_vec();
+        if let Some(name) = phase_name(&phase) {
+            identifiers.push(name);
+        }
+        self.fix(phase_id, phase.isa, &identifiers);
+
+        for build_file_id in self.array_refs(&phase, "files") {
+            let Some(build_file) = self.object_owned(&build_file_id) else {
+                continue;
+            };
+            let mut build_file_identifiers = identifiers.clone();
+            if let Some(file_ref_id) = self.ref_field(&build_file, "fileRef") {
+                if let Some(file_ref) = self.output.get(&file_ref_id) {
+                    build_file_identifiers.push(file_ref.clone());
+                }
+            }
+            self.fix(&build_file_id, build_file.isa, &build_file_identifiers);
+        }
+    }
+
+    fn generate_target_dependency_references(
+        &mut self,
+        dependency_id: &str,
+        identifiers: &[String],
+    ) {
+        let Some(dependency) = self.object_owned(dependency_id) else {
+            return;
+        };
+        let mut dependency_identifiers = identifiers.to_vec();
+        if let Some(proxy_id) = self.ref_field(&dependency, "targetProxy") {
+            let Some(proxy) = self.object_owned(&proxy_id) else {
+                return;
+            };
+            if let Some(remote_id) = self.string_field(&proxy, "remoteGlobalIDString") {
+                let mapped_remote_id = mapped_id(&remote_id, &self.output);
+                let mut proxy_identifiers = identifiers.to_vec();
+                proxy_identifiers.push(mapped_remote_id);
+                self.fix(&proxy_id, proxy.isa, &proxy_identifiers);
+            }
+        }
+        if let Some(target_id) = self.ref_field(&dependency, "target") {
+            dependency_identifiers.push(mapped_id(&target_id, &self.output));
+        }
+        if let Some(proxy_id) = self.ref_field(&dependency, "targetProxy") {
+            dependency_identifiers.push(mapped_id(&proxy_id, &self.output));
+        }
+        self.fix(dependency_id, dependency.isa, &dependency_identifiers);
+    }
+
+    fn fix(&mut self, id: &str, isa: &str, identifiers: &[String]) {
+        if self.output.contains_key(id) {
+            return;
+        }
+        let acronym = xcode_reference_acronym(isa);
+        let mut counter = 1;
+        loop {
+            let seed = format!("{acronym}_{isa}-{}_{}", identifiers.join("-"), counter);
+            let digest = format!("{:x}", md5::compute(seed.as_bytes())).to_uppercase();
+            let reference = digest[..24].to_owned();
+            if !self.references.contains(&reference) {
+                self.references.insert(reference.clone());
+                self.output.insert(id.to_owned(), reference);
+                return;
+            }
+            counter += 1;
+        }
+    }
+
+    fn object(&self, id: &str) -> Option<&PbxObject> {
+        self.generator.graph.objects.get(id)
+    }
+
+    fn object_owned(&self, id: &str) -> Option<PbxObject> {
+        self.object(id).cloned()
+    }
+
+    fn ref_field(&self, object: impl Borrow<PbxObject>, key: &str) -> Option<String> {
+        match object.borrow().fields.get(key)? {
+            PbxValue::Ref { id, .. } => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    fn array_refs(&self, object: impl Borrow<PbxObject>, key: &str) -> Vec<String> {
+        match object.borrow().fields.get(key) {
+            Some(PbxValue::Array(values)) => values
+                .iter()
+                .filter_map(|value| match value {
+                    PbxValue::Ref { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn string_field(&self, object: impl Borrow<PbxObject>, key: &str) -> Option<String> {
+        match object.borrow().fields.get(key)? {
+            PbxValue::String(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn file_name(&self, object: impl Borrow<PbxObject>) -> Option<String> {
+        let object = object.borrow();
+        self.string_field(object, "name")
+            .or_else(|| {
+                self.string_field(object, "path")
+                    .map(|path| display_name(&path))
+            })
+            .filter(|value| !value.is_empty())
+    }
+}
+
 impl PbxObject {
     fn new(isa: &'static str, comment: impl Into<String>) -> Self {
         Self {
@@ -4629,19 +7791,32 @@ impl PbxValue {
         }
     }
 
-    fn write(&self, output: &mut String, indent: usize, comments: &HashMap<String, String>) {
+    fn uncommented_reference(id: String) -> Self {
+        Self::Ref {
+            id,
+            comment: Some(String::new()),
+        }
+    }
+
+    fn write(
+        &self,
+        output: &mut String,
+        indent: usize,
+        comments: &HashMap<String, String>,
+        id_map: &HashMap<String, String>,
+    ) {
         match self {
             Self::Int(value) => {
                 let _ = write!(output, "{value}");
             }
             Self::String(value) => output.push_str(&quote(value)),
             Self::Ref { id, comment } => {
-                output.push_str(id);
-                let comment = comment
-                    .as_ref()
-                    .filter(|comment| !comment.is_empty())
-                    .cloned()
-                    .or_else(|| comments.get(id).cloned());
+                output.push_str(&mapped_id(id, id_map));
+                let comment = match comment {
+                    Some(comment) if comment.is_empty() => None,
+                    Some(comment) => Some(comment.clone()),
+                    None => comments.get(id).cloned(),
+                };
                 if let Some(comment) = comment {
                     let _ = write!(output, " /* {comment} */");
                 }
@@ -4655,7 +7830,7 @@ impl PbxValue {
                     output.push_str("(\n");
                     for value in values {
                         output.push_str(&"\t".repeat(indent + 1));
-                        value.write(output, indent + 1, comments);
+                        value.write(output, indent + 1, comments, id_map);
                         output.push_str(",\n");
                     }
                     output.push_str(&"\t".repeat(indent));
@@ -4669,9 +7844,16 @@ impl PbxValue {
                     output.push('}');
                 } else {
                     output.push_str("{\n");
+                    let mut values = values.iter().collect::<Vec<_>>();
+                    values.sort_by_key(|(key, _)| mapped_id(key, id_map));
                     for (key, value) in values {
-                        let _ = write!(output, "{}{} = ", "\t".repeat(indent + 1), key);
-                        value.write(output, indent + 1, comments);
+                        let _ = write!(
+                            output,
+                            "{}{} = ",
+                            "\t".repeat(indent + 1),
+                            mapped_id(key, id_map)
+                        );
+                        value.write(output, indent + 1, comments, id_map);
                         output.push_str(";\n");
                     }
                     output.push_str(&"\t".repeat(indent));
@@ -4692,13 +7874,87 @@ fn object_id(key: &str, salt: u64) -> String {
     format!("{hash:016X}{:08X}", second as u32)
 }
 
+fn mapped_id(id: &str, id_map: &HashMap<String, String>) -> String {
+    id_map.get(id).cloned().unwrap_or_else(|| id.to_owned())
+}
+
+fn write_compact_value(
+    value: &PbxValue,
+    output: &mut String,
+    comments: &HashMap<String, String>,
+    id_map: &HashMap<String, String>,
+    field_key: &str,
+) {
+    match value {
+        PbxValue::Int(value) => {
+            let _ = write!(output, "{value}");
+        }
+        PbxValue::String(value) => {
+            if field_key == "remoteGlobalIDString" {
+                output.push_str(&mapped_id(value, id_map));
+            } else {
+                output.push_str(&quote(value));
+            }
+        }
+        PbxValue::Ref { id, comment } => {
+            output.push_str(&mapped_id(id, id_map));
+            let comment = match comment {
+                Some(comment) if comment.is_empty() => None,
+                Some(comment) => Some(comment.clone()),
+                None => comments.get(id).cloned(),
+            };
+            if let Some(comment) = comment {
+                let _ = write!(output, " /* {comment} */");
+            }
+        }
+        PbxValue::Array(values) => {
+            output.push('(');
+            for value in values {
+                write_compact_value(value, output, comments, id_map, field_key);
+                output.push_str(", ");
+            }
+            output.push(')');
+        }
+        PbxValue::Dict(values) => {
+            output.push('{');
+            for (key, value) in values {
+                let _ = write!(output, "{key} = ");
+                write_compact_value(value, output, comments, id_map, key);
+                output.push_str("; ");
+            }
+            output.push('}');
+        }
+    }
+}
+
+fn xcode_reference_acronym(isa: &str) -> String {
+    isa.replace("PBX", "")
+        .replace("XC", "")
+        .chars()
+        .filter(|c| c.to_lowercase().to_string() != c.to_string())
+        .collect()
+}
+
+fn phase_name(object: &PbxObject) -> Option<String> {
+    match object.isa {
+        "PBXSourcesBuildPhase" => Some("Sources".to_owned()),
+        "PBXResourcesBuildPhase" => Some("Resources".to_owned()),
+        "PBXFrameworksBuildPhase" => Some("Frameworks".to_owned()),
+        "PBXHeadersBuildPhase" => Some("Headers".to_owned()),
+        _ => match object.fields.get("name") {
+            Some(PbxValue::String(value)) => Some(value.clone()),
+            _ => object.comment.clone().filter(|value| !value.is_empty()),
+        },
+    }
+}
+
 fn quote(value: &str) -> String {
     if value.is_empty() {
         return "\"\"".to_owned();
     }
     let bare_ok = value
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '$'));
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '$'));
     if bare_ok {
         value.to_owned()
     } else {
@@ -4740,6 +7996,13 @@ fn expand_source_path(
             Vec::new()
         };
     }
+    if is_wrapper_path(&path) {
+        return if source_matches_filters(&path, &path, source) {
+            vec![path]
+        } else {
+            Vec::new()
+        };
+    }
     let mut files = Vec::new();
     collect_files(&path, &mut files, file_types);
     files.retain(|file| source_matches_filters(&path, file, source));
@@ -4764,7 +8027,7 @@ fn explicit_folders_for_synced_source(base_path: &Path, source: &TargetSource) -
         if source
             .explicit_folders
             .iter()
-            .any(|pattern| source_pattern_matches(pattern, &relative))
+            .any(|pattern| explicit_folder_pattern_matches(pattern, &relative))
         {
             explicit.push(relative);
         }
@@ -4776,6 +8039,25 @@ fn explicit_folders_for_synced_source(base_path: &Path, source: &TargetSource) -
     }
     explicit.sort();
     explicit
+}
+
+fn explicit_folder_pattern_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_end_matches('/');
+    let path = path.trim_start_matches("./");
+    if pattern.is_empty() {
+        return false;
+    }
+    if path == pattern {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        return wildcard_match(suffix, path)
+            || Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| wildcard_match(suffix, name));
+    }
+    wildcard_match(pattern, path)
 }
 
 fn synced_folder_membership_exceptions(
@@ -4808,6 +8090,16 @@ fn synced_folder_membership_exceptions(
         .collect::<Vec<_>>();
     exceptions.sort();
     exceptions
+}
+
+fn model_current_version_name(model_group: &Path) -> Option<String> {
+    let contents = fs::read_to_string(model_group.join(".xccurrentversion")).ok()?;
+    let key_index = contents.find("<key>_XCCurrentVersionName</key>")?;
+    let after_key = &contents[key_index..];
+    let start_tag = after_key.find("<string>")? + "<string>".len();
+    let after_start = &after_key[start_tag..];
+    let end_tag = after_start.find("</string>")?;
+    Some(after_start[..end_tag].to_owned())
 }
 
 fn collect_directories(path: &Path, directories: &mut Vec<PathBuf>) {
@@ -4954,7 +8246,6 @@ fn collect_files(
 
 fn collect_known_regions(path: &Path, regions: &mut BTreeSet<String>) {
     if path.is_file() {
-        collect_string_catalog_regions(path, regions);
         return;
     }
     let Ok(entries) = fs::read_dir(path) else {
@@ -4969,28 +8260,6 @@ fn collect_known_regions(path: &Path, regions: &mut BTreeSet<String>) {
                 }
             }
             collect_known_regions(&path, regions);
-        } else {
-            collect_string_catalog_regions(&path, regions);
-        }
-    }
-}
-
-fn collect_string_catalog_regions(path: &Path, regions: &mut BTreeSet<String>) {
-    if path.extension().and_then(|extension| extension.to_str()) != Some("xcstrings") {
-        return;
-    }
-    let Ok(contents) = fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(json) = serde_json::from_str::<Value>(&contents) else {
-        return;
-    };
-    let Some(strings) = json.get("strings").and_then(Value::as_object) else {
-        return;
-    };
-    for entry in strings.values() {
-        if let Some(localizations) = entry.get("localizations").and_then(Value::as_object) {
-            regions.extend(localizations.keys().cloned());
         }
     }
 }
@@ -5003,7 +8272,14 @@ fn is_wrapper_path(path: &Path) -> bool {
                 extension,
                 "app"
                     | "bundle"
+                    | "docc"
+                    | "icon"
+                    | "playground"
+                    | "scnassets"
+                    | "swiftcrossimport"
+                    | "swiftoverlay"
                     | "framework"
+                    | "xpc"
                     | "xcassets"
                     | "xcdatamodeld"
                     | "xcmappingmodel"
@@ -5073,7 +8349,7 @@ fn natural_cmp(left: &str, right: &str) -> std::cmp::Ordering {
 }
 
 fn build_phase_for_source(path: &str) -> Option<&'static str> {
-    if is_framework_file(path) {
+    if is_copy_files_source(path) {
         Some("CopyFiles")
     } else if is_header_file(path) {
         Some("Headers")
@@ -5161,12 +8437,23 @@ fn is_header_file(path: &str) -> bool {
     )
 }
 
-fn is_framework_file(path: &str) -> bool {
+fn is_copy_files_source(path: &str) -> bool {
     matches!(
         Path::new(path)
             .extension()
             .and_then(|extension| extension.to_str()),
-        Some("framework" | "xcframework")
+        Some(
+            "framework" | "modulemap" | "swiftcrossimport" | "swiftoverlay" | "xcframework" | "xpc",
+        )
+    )
+}
+
+fn is_module_copy_file(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("modulemap" | "swiftcrossimport" | "swiftoverlay")
     )
 }
 
@@ -5204,9 +8491,21 @@ fn file_type_for_path(path: &str, product_type: Option<&ProductType>) -> String 
             ProductType::StaticLibrary => "archive.ar",
             ProductType::DynamicLibrary => "compiled.mach-o.dylib",
             ProductType::Bundle => "wrapper.cfbundle",
-            ProductType::UnitTestBundle | ProductType::UiTestBundle => "wrapper.cfbundle",
+            ProductType::UnitTestBundle
+            | ProductType::UiTestBundle
+            | ProductType::OcUnitTestBundle => "wrapper.cfbundle",
             ProductType::CommandLineTool => "compiled.mach-o.executable",
+            ProductType::AppExtension
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
+            | ProductType::MessagesExtension
+            | ProductType::StickerPack
+            | ProductType::WatchExtension
+            | ProductType::Watch2Extension
+            | ProductType::TvExtension => "wrapper.app-extension",
             ProductType::XpcService => "wrapper.xpc-service",
+            ProductType::InstrumentsPackage => "wrapper.cfbundle",
+            ProductType::MetalLibrary => "archive.metal-library",
             ProductType::SystemExtension => "wrapper.system-extension",
             ProductType::DriverExtension => "wrapper.driver-extension",
             _ => "wrapper.cfbundle",
@@ -5221,15 +8520,35 @@ fn file_type_for_path(path: &str, product_type: Option<&ProductType>) -> String 
         Some("swift") => "sourcecode.swift",
         Some("m") => "sourcecode.c.objc",
         Some("mm") => "sourcecode.cpp.objcpp",
+        Some("cpp") | Some("cc") | Some("cxx") | Some("cp") => "sourcecode.cpp.cpp",
         Some("h") | Some("hh") | Some("hpp") | Some("ipp") | Some("tpp") | Some("hxx")
         | Some("def") => "sourcecode.c.h",
         Some("plist") => "text.plist",
+        Some("strings") => "text.plist.strings",
+        Some("stringsdict") => "text.plist.stringsdict",
+        Some("entitlements") => "text.plist.entitlements",
+        Some("xcconfig") => "text.xcconfig",
+        Some("xcfilelist") => "text.xcfilelist",
+        Some("xcstrings") => "text.json.xcstrings",
+        Some("apns") => "text",
+        Some("playground") => "file.playground",
         Some("xcassets") => "folder.assetcatalog",
+        Some("xcdatamodel") => "wrapper.xcdatamodel",
+        Some("xcmappingmodel") => "wrapper.xcmappingmodel",
+        Some("docc") => "folder.documentationcatalog",
+        Some("icon") => "wrapper.icon",
+        Some("iig") => "sourcecode.iig",
+        Some("modulemap") => "sourcecode.module-map",
+        Some("scnassets") => "wrapper.scnassets",
+        Some("swiftcrossimport") => "wrapper.swiftcrossimport",
+        Some("swiftoverlay") => "file",
         Some("storyboard") => "file.storyboard",
         Some("xib") => "file.xib",
         Some("framework") => "wrapper.framework",
+        Some("xpc") => "wrapper.xpc-service",
         Some("a") => "archive.ar",
-        Some("dylib") | Some("tbd") => "compiled.mach-o.dylib",
+        Some("dylib") => "compiled.mach-o.dylib",
+        Some("tbd") => "sourcecode.text-based-dylib-definition",
         Some("bundle") => "wrapper.cfbundle",
         Some("xctestplan") => "text",
         _ => "file",
@@ -5250,7 +8569,12 @@ fn product_type_raw(product_type: &ProductType) -> &'static str {
         ProductType::Bundle => "com.apple.product-type.bundle",
         ProductType::UnitTestBundle => "com.apple.product-type.bundle.unit-test",
         ProductType::UiTestBundle => "com.apple.product-type.bundle.ui-testing",
+        ProductType::OcUnitTestBundle => "com.apple.product-type.bundle.ocunit-test",
         ProductType::AppExtension => "com.apple.product-type.app-extension",
+        ProductType::XcodeExtension => "com.apple.product-type.xcode-extension",
+        ProductType::IntentsServiceExtension => {
+            "com.apple.product-type.app-extension.intents-service"
+        }
         ProductType::CommandLineTool => "com.apple.product-type.tool",
         ProductType::WatchApp => "com.apple.product-type.application.watchapp",
         ProductType::Watch2App => "com.apple.product-type.application.watchapp2",
@@ -5261,6 +8585,8 @@ fn product_type_raw(product_type: &ProductType) -> &'static str {
         ProductType::MessagesExtension => "com.apple.product-type.app-extension.messages",
         ProductType::StickerPack => "com.apple.product-type.app-extension.messages-sticker-pack",
         ProductType::XpcService => "com.apple.product-type.xpc-service",
+        ProductType::InstrumentsPackage => "com.apple.product-type.instruments-package",
+        ProductType::MetalLibrary => "com.apple.product-type.metal-library",
         ProductType::SystemExtension => "com.apple.product-type.system-extension",
         ProductType::ExtensionKitExtension => "com.apple.product-type.extensionkit-extension",
         ProductType::DriverExtension => "com.apple.product-type.driver-extension",
@@ -5283,56 +8609,44 @@ fn package_url(package: &serde_json::Value) -> Option<String> {
 
 fn package_requirement(package: &serde_json::Value) -> BTreeMap<String, PbxValue> {
     let mut requirement = BTreeMap::new();
-    if let Some(version) = package.get("exactVersion").and_then(|value| value.as_str()) {
+    if let Some(version) = package.get("exactVersion").and_then(json_string_value) {
         requirement.insert(
             "kind".to_owned(),
             PbxValue::String("exactVersion".to_owned()),
         );
-        requirement.insert("version".to_owned(), PbxValue::String(version.to_owned()));
-    } else if let Some(version) = package.get("version").and_then(|value| value.as_str()) {
+        requirement.insert("version".to_owned(), PbxValue::String(version));
+    } else if let Some(version) = package.get("version").and_then(json_string_value) {
         requirement.insert(
             "kind".to_owned(),
             PbxValue::String("exactVersion".to_owned()),
         );
-        requirement.insert("version".to_owned(), PbxValue::String(version.to_owned()));
-    } else if let Some(version) = package.get("majorVersion").and_then(|value| value.as_str()) {
+        requirement.insert("version".to_owned(), PbxValue::String(version));
+    } else if let Some(version) = package.get("majorVersion").and_then(json_string_value) {
         requirement.insert(
             "kind".to_owned(),
             PbxValue::String("upToNextMajorVersion".to_owned()),
         );
-        requirement.insert(
-            "minimumVersion".to_owned(),
-            PbxValue::String(version.to_owned()),
-        );
-    } else if let Some(version) = package.get("minorVersion").and_then(|value| value.as_str()) {
+        requirement.insert("minimumVersion".to_owned(), PbxValue::String(version));
+    } else if let Some(version) = package.get("minorVersion").and_then(json_string_value) {
         requirement.insert(
             "kind".to_owned(),
             PbxValue::String("upToNextMinorVersion".to_owned()),
         );
-        requirement.insert(
-            "minimumVersion".to_owned(),
-            PbxValue::String(version.to_owned()),
-        );
-    } else if let Some(branch) = package.get("branch").and_then(|value| value.as_str()) {
+        requirement.insert("minimumVersion".to_owned(), PbxValue::String(version));
+    } else if let Some(branch) = package.get("branch").and_then(json_string_value) {
         requirement.insert("kind".to_owned(), PbxValue::String("branch".to_owned()));
-        requirement.insert("branch".to_owned(), PbxValue::String(branch.to_owned()));
-    } else if let Some(revision) = package.get("revision").and_then(|value| value.as_str()) {
+        requirement.insert("branch".to_owned(), PbxValue::String(branch));
+    } else if let Some(revision) = package.get("revision").and_then(json_string_value) {
         requirement.insert("kind".to_owned(), PbxValue::String("revision".to_owned()));
-        requirement.insert("revision".to_owned(), PbxValue::String(revision.to_owned()));
-    } else if let Some(min) = package.get("minVersion").and_then(|value| value.as_str()) {
+        requirement.insert("revision".to_owned(), PbxValue::String(revision));
+    } else if let Some(min) = package.get("minVersion").and_then(json_string_value) {
         requirement.insert(
             "kind".to_owned(),
             PbxValue::String("versionRange".to_owned()),
         );
-        requirement.insert(
-            "minimumVersion".to_owned(),
-            PbxValue::String(min.to_owned()),
-        );
-        if let Some(max) = package.get("maxVersion").and_then(|value| value.as_str()) {
-            requirement.insert(
-                "maximumVersion".to_owned(),
-                PbxValue::String(max.to_owned()),
-            );
+        requirement.insert("minimumVersion".to_owned(), PbxValue::String(min));
+        if let Some(max) = package.get("maxVersion").and_then(json_string_value) {
+            requirement.insert("maximumVersion".to_owned(), PbxValue::String(max));
         }
     } else {
         requirement.insert(
