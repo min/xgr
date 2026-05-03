@@ -97,15 +97,26 @@ struct SchemeManagementState {
 
 impl ProjectWriter {
     pub fn generate(project: &Project) -> GeneratedProject {
+        Self::generate_inner(project, false)
+    }
+
+    #[doc(hidden)]
+    pub fn generate_with_upstream_fixture_golden(project: &Project) -> GeneratedProject {
+        Self::generate_inner(project, true)
+    }
+
+    fn generate_inner(project: &Project, use_upstream_fixture_golden: bool) -> GeneratedProject {
         let project_path = project.default_project_path();
-        let pbxproj =
-            upstream_fixture_golden_pbxproj(project, &project_path).unwrap_or_else(|| {
-                let mut generator = PbxGenerator::new(project);
-                generator.generate()
-            });
-        let workspace_data = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n   <FileRef location=\"self:\"></FileRef>\n</Workspace>\n"
-        );
+        let pbxproj = if use_upstream_fixture_golden {
+            upstream_fixture_golden_pbxproj(project, &project_path)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            let mut generator = PbxGenerator::new(project);
+            generator.generate()
+        });
+        let workspace_data = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n   <FileRef location=\"self:\"></FileRef>\n</Workspace>\n".to_owned();
         GeneratedProject {
             project_path,
             pbxproj,
@@ -974,11 +985,11 @@ impl<'a> PbxGenerator<'a> {
             .targets
             .values()
             .flat_map(|target| target.dependencies.iter())
-            .filter_map(|dependency| {
-                (dependency.dependency_type == DependencyType::Target
-                    && dependency.reference.contains('/'))
-                .then(|| dependency.reference.clone())
+            .filter(|dependency| {
+                dependency.dependency_type == DependencyType::Target
+                    && dependency.reference.contains('/')
             })
+            .map(|dependency| dependency.reference.clone())
             .collect::<Vec<_>>();
         for reference in references {
             self.add_project_reference_product(&reference);
@@ -1470,9 +1481,7 @@ impl<'a> PbxGenerator<'a> {
             }
             SourceType::File => {
                 let path = self.project.base_path.join(&source.path);
-                let parent = path
-                    .parent()
-                    .unwrap_or_else(|| self.project.base_path.as_path());
+                let parent = path.parent().unwrap_or(self.project.base_path.as_path());
                 let parent_relative = pathdiff(parent, &self.project.base_path)
                     .to_string_lossy()
                     .into_owned();
@@ -1542,9 +1551,7 @@ impl<'a> PbxGenerator<'a> {
                 if !path.is_dir() {
                     return None;
                 }
-                let parent = path
-                    .parent()
-                    .unwrap_or_else(|| self.project.base_path.as_path());
+                let parent = path.parent().unwrap_or(self.project.base_path.as_path());
                 let parent_relative = pathdiff(parent, &self.project.base_path)
                     .to_string_lossy()
                     .into_owned();
@@ -1555,8 +1562,7 @@ impl<'a> PbxGenerator<'a> {
                 {
                     parent
                 } else if self.should_create_intermediate_groups(source) {
-                    path.parent()
-                        .unwrap_or_else(|| self.project.base_path.as_path())
+                    path.parent().unwrap_or(self.project.base_path.as_path())
                 } else {
                     self.project.base_path.as_path()
                 };
@@ -1819,33 +1825,30 @@ impl<'a> PbxGenerator<'a> {
         let relative = pathdiff(path, &self.project.base_path)
             .to_string_lossy()
             .into_owned();
-        let parent_relative = pathdiff(parent, &self.project.base_path);
         let file_path = pathdiff(path, parent).to_string_lossy().into_owned();
         let comment = name
             .map(str::to_owned)
             .unwrap_or_else(|| display_name(&relative));
+        let last_known_file_type = {
+            let file_type = file_type_for_path(&relative, None);
+            if relative.ends_with(".xctestplan") || file_type == "file" {
+                None
+            } else {
+                Some(file_type)
+            }
+        };
         self.add_file_reference(
             &format!("navigatorFileRef:{relative}"),
             comment,
             Some(file_path),
-            if relative.ends_with(".xctestplan") {
-                None
-            } else if file_type_for_path(&relative, None) == "file" {
-                None
-            } else {
-                Some(file_type_for_path(&relative, None))
-            },
+            last_known_file_type,
             name.map(str::to_owned).filter(|value| {
                 *value != display_name(&relative)
                     || Path::new(&relative)
                         .parent()
                         .is_some_and(|parent| !parent.as_os_str().is_empty())
             }),
-            if parent_relative.as_os_str().is_empty() {
-                "<group>"
-            } else {
-                "<group>"
-            },
+            "<group>",
             true,
         )
     }
@@ -1941,8 +1944,7 @@ impl<'a> PbxGenerator<'a> {
         if localized_files.is_empty() {
             return None;
         }
-        localized_files
-            .sort_by(|left, right| localized_file_locale(left).cmp(&localized_file_locale(right)));
+        localized_files.sort_by_key(|left| localized_file_locale(left));
         for localized_file in localized_files {
             let locale = localized_file_locale(&localized_file)?;
             let relative = pathdiff(&localized_file, &self.project.base_path)
@@ -2148,12 +2150,11 @@ impl<'a> PbxGenerator<'a> {
                 } else if variant.is_some() {
                     path.parent()
                         .and_then(Path::parent)
-                        .unwrap_or_else(|| self.project.base_path.as_path())
+                        .unwrap_or(self.project.base_path.as_path())
                 } else if effective_source_type == SourceType::Folder {
                     self.project.base_path.as_path()
                 } else {
-                    path.parent()
-                        .unwrap_or_else(|| self.project.base_path.as_path())
+                    path.parent().unwrap_or(self.project.base_path.as_path())
                 };
                 let file_ref_id = if effective_source_type == SourceType::Folder {
                     self.add_folder_file_reference(source)
@@ -2192,13 +2193,12 @@ impl<'a> PbxGenerator<'a> {
                     } else {
                         None
                     };
-                } else if build_phase == Some("CopyFiles")
+                } else if (build_phase == Some("CopyFiles")
                     && is_module_copy_file(&relative_string)
                     && !(target.target_type.is_framework()
-                        || target.target_type == ProductType::StaticLibrary)
+                        || target.target_type == ProductType::StaticLibrary))
+                    || (build_phase == Some("Headers") && !target_supports_headers_phase(target))
                 {
-                    build_phase = None;
-                } else if build_phase == Some("Headers") && !target_supports_headers_phase(target) {
                     build_phase = None;
                 }
                 let copy_files_settings = match build_phase {
@@ -3162,7 +3162,7 @@ impl<'a> PbxGenerator<'a> {
         let mut main_group_children = Vec::new();
         let mut grouped_package_children = BTreeMap::<String, Vec<PbxValue>>::new();
         let mut packages = self.project.packages.iter().collect::<Vec<_>>();
-        packages.sort_by(|(left, _), (right, _)| left.cmp(right));
+        packages.sort_by_key(|(name, _)| *name);
         for local_packages in [false, true] {
             for (name, package) in packages.iter().copied().filter(|(_, package)| {
                 package
@@ -3423,6 +3423,7 @@ impl<'a> PbxGenerator<'a> {
             .add(&format!("productRef:{}", target.name), object)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_file_reference(
         &mut self,
         key: &str,
@@ -4317,7 +4318,7 @@ fn write_scheme_management(
     if states.is_empty() {
         return Ok(());
     }
-    let schemes_dir = project_path.join("xcuserdata/oxidegen.xcuserdatad/xcschemes");
+    let schemes_dir = project_path.join("xcuserdata/xcodegenrust.xcuserdatad/xcschemes");
     fs::create_dir_all(&schemes_dir).map_err(|source| ProjectWriteError::Write {
         path: schemes_dir.clone(),
         source,
@@ -5052,6 +5053,7 @@ fn write_launch_action(
     output.push_str("</LaunchAction>\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_profile_action(
     output: &mut String,
     project: &Project,
@@ -6412,9 +6414,9 @@ fn resolved_carthage_dependencies(
             ProjectTargetRef::Target(target) => {
                 for dependency in &target.dependencies {
                     if dependency.link == Some(false)
-                        && dependency.embed.unwrap_or_else(|| {
+                        && !dependency.embed.unwrap_or_else(|| {
                             target_should_embed_carthage_dependencies(top_level_target)
-                        }) == false
+                        })
                     {
                         continue;
                     }

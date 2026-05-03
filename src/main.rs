@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
-use oxidegen::{Project, ProjectWriter, SpecFile, SpecLoader};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use xcodegenrust::{Project, ProjectWriter, SpecFile, SpecLoader};
 
 #[derive(Debug, Parser)]
-#[command(name = "oxidegen")]
+#[command(name = "xgr")]
 #[command(about = "Rust implementation of XcodeGen-compatible project.yml loading")]
 struct Cli {
     #[command(subcommand)]

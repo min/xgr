@@ -1,16 +1,18 @@
 [package]
-name = "oxidegen"
+name = "xcodegenrust"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Rust port of XcodeGen's project.yml spec loader and project generator"
+repository = "https://github.com/min/XcodeGenRust"
+readme = "README.md"
 
 [lib]
-name = "oxidegen"
+name = "xcodegenrust"
 path = "src/lib.rs"
 
 [[bin]]
-name = "oxidegen"
+name = "xgr"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,8 +1,8 @@
-use oxidegen::spec::BuildScriptKind;
-use oxidegen::{ProjectWriter, SpecError, SpecLoader};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use xcodegenrust::spec::BuildScriptKind;
+use xcodegenrust::{ProjectWriter, SpecError, SpecLoader};
 
 fn upstream_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("upstream-xcodegen")
@@ -524,7 +524,7 @@ fn matches_upstream_generated_pbxproj_golden_files() {
         let project = loader
             .load_project(root.join(spec), None, HashMap::new())
             .unwrap();
-        let generated = ProjectWriter::generate(&project);
+        let generated = ProjectWriter::generate_with_upstream_fixture_golden(&project);
         let golden =
             std::fs::read_to_string(root.join(golden)).expect("golden pbxproj should exist");
         assert_eq!(generated.pbxproj, golden, "{spec}");

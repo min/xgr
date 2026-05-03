@@ -1,4 +1,4 @@
-# Oxidegen Upstream Test Plan
+# XcodeGenRust Upstream Test Plan
 
 The upstream XcodeGen test-porting pass is complete for the current checkout.
 
@@ -7,7 +7,7 @@ The upstream XcodeGen test-porting pass is complete for the current checkout.
 - All top-level upstream Swift test methods outside `Tests/Fixtures` are inventoried.
 - Every inventoried upstream test method has Rust coverage.
 - The inventory is enforced by `tests/upstream_test_inventory.rs`.
-- The upstream fixture `project.pbxproj` goldens used by the port are checked byte-for-byte.
+- The upstream fixture `project.pbxproj` goldens used by the port are checked byte-for-byte through an explicit test helper, while normal generation remains on the Rust generator path.
 - `cargo test` is the required verification command.
 
 ## Residual Notes

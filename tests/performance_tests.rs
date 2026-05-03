@@ -1,7 +1,7 @@
-use oxidegen::{ProjectWriter, SpecFile, SpecLoader};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use xcodegenrust::{ProjectWriter, SpecFile, SpecLoader};
 
 fn upstream_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("upstream-xcodegen")
@@ -30,7 +30,7 @@ targets:
     (temp, spec_path)
 }
 
-fn load_project(spec_path: impl AsRef<Path>) -> oxidegen::Project {
+fn load_project(spec_path: impl AsRef<Path>) -> xcodegenrust::Project {
     let mut loader = SpecLoader::default();
     loader
         .load_project(spec_path, None, HashMap::new())

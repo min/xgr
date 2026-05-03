@@ -2565,13 +2565,14 @@ fn collect_target_validation_errors(
                 }
                 continue;
             }
-            DependencyType::Target if !dependency.reference.contains('/') => {
-                if !project.targets.contains_key(&dependency.reference) {
-                    errors.push(ValidationError::InvalidTargetDependency {
-                        target: target.name.clone(),
-                        dependency: dependency.reference.clone(),
-                    });
-                }
+            DependencyType::Target
+                if !dependency.reference.contains('/')
+                    && !project.targets.contains_key(&dependency.reference) =>
+            {
+                errors.push(ValidationError::InvalidTargetDependency {
+                    target: target.name.clone(),
+                    dependency: dependency.reference.clone(),
+                });
             }
             DependencyType::Target => {
                 if let Some(reference) = project_reference_name(&dependency.reference) {
@@ -2583,13 +2584,11 @@ fn collect_target_validation_errors(
                     }
                 }
             }
-            DependencyType::Sdk { .. } => {
-                if !is_valid_sdk_dependency(&dependency.reference) {
-                    errors.push(ValidationError::InvalidSdkDependency {
-                        target: target.name.clone(),
-                        dependency: dependency.reference.clone(),
-                    });
-                }
+            DependencyType::Sdk { .. } if !is_valid_sdk_dependency(&dependency.reference) => {
+                errors.push(ValidationError::InvalidSdkDependency {
+                    target: target.name.clone(),
+                    dependency: dependency.reference.clone(),
+                });
             }
             _ => {}
         }
