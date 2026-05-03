@@ -43,11 +43,20 @@ Known limitations:
 - Compatibility is measured against the vendored `upstream-xcodegen` checkout. Updating that checkout requires rerunning the inventory workflow documented in `TEST_PARITY.md`.
 - The project is not yet released as a supported replacement for every real-world XcodeGen configuration. If output differs from upstream XcodeGen, please file a compatibility issue with the spec and a description of the expected output.
 
+## Install With Homebrew
+
+```sh
+brew tap min/xcodegen-rs https://github.com/min/xcodegen-rs
+brew install xcodegen-rs
+```
+
+This installs the `xgr` CLI.
+
 ## Install From Source
 
 ```sh
-git clone --recurse-submodules https://github.com/min/XcodeGenRust.git
-cd XcodeGenRust
+git clone --recurse-submodules https://github.com/min/xcodegen-rs.git
+cd xcodegen-rs
 cargo build --release --locked
 ```
 
