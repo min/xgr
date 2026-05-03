@@ -1,164 +1,102 @@
 # XcodeGen Test Parity
 
-This tracks upstream test coverage ported into the Rust implementation.
+This tracks upstream `yonaskolb/XcodeGen` test coverage ported into the Rust implementation.
 
-The remaining porting sequence is tracked in `REMAINING_TEST_PLAN.md`.
+## Current Status
 
-## Ported and Passing
+- Upstream top-level Swift test methods in this checkout: 75.
+- Rust porting status for those upstream methods: 75 accounted for.
+- Current Rust suite: 197 tests, all intended to run under `cargo test`.
+- Fixture `project.pbxproj` parity: byte-for-byte equality is enforced for all checked upstream generated fixture goldens used by this port.
 
-- `Tests/XcodeGenCoreTests/ArrayExtensionsTests.swift`
-  - `SortedArray` sorting
-  - first matching index on sorted arrays
-- `Tests/XcodeGenCoreTests/PathExtensionsTests.swift`
-  - relative path behavior, including error cases
-- `Tests/XcodeGenCoreTests/GlobTests.swift`
-  - brace expansion
-  - direct access / repeat iteration behavior via deterministic result collection
-  - Bash v3 `**`
-  - Bash v4 `**`
-  - Gradle `**`
-  - blacklisted directories
-- `Tests/XcodeGenCoreTests/AtomicTests.swift`
-  - simultaneous writes through an atomic wrapper
-- `Tests/ProjectSpecTests/Dictionary+Extension_Tests.swift`
-  - removes nulls, empty arrays, and empty dictionaries recursively
-- `Tests/ProjectSpecTests/InvalidConfigsFormatTests.swift`
-  - all four invalid `settings.configs` fixture files
-- Selected `Tests/ProjectSpecTests/ProjectSpecTests.swift`
-  - product type metadata
-  - target filenames
-  - platform deployment setting / SDK root
-  - deployment target version formatting
-  - validation for minimum XcodeGen version, default configs, config-scoped settings, setting groups, config file paths, file groups, local packages, target sources, build script paths, SDK dependencies, target config files, target scheme test references, duplicate dependencies, empty source paths, missing Swift packages, build-tool plugin package references, supported destinations, aggregate target references, scheme references/configs, test plan paths, multiple default test plans, and project references
-- Selected `Tests/ProjectSpecTests/SpecLoadingTests.swift`
-  - include merging
-  - duplicate include protection
-  - include-relative path rewriting
-  - YAML/JSON fixture loading
-  - environment and template variable expansion
-  - source parsing
-  - dependency parsing and platform filtering
-  - cross-platform target expansion
-  - legacy local packages
-  - breakpoints and breakpoint actions
-  - run scripts
-  - build rules
-  - build tool plugins
-  - aggregate targets
-  - options
-  - Swift packages and package version validation
-  - target schemes
-  - schemes and scheme templates
-  - nested target templates, template attribute precedence, and template cycles
-  - settings
-  - plists
-- `Tests/FixtureTests/FixtureTests.swift`
-  - primary fixture specs load
-  - write-level generation for TestProject/AnotherProject, TestProject, CarthageProject, and SPM fixture apps
-  - fixture scheme and breakpoint artifact writes for generated fixture projects
-  - sample fixture XCTest source methods are accounted for in generated project graphs
-  - graph writer emits real PBX sections for SPM fixture
-- Selected `Tests/XcodeGenKitTests/PBXProjGeneratorTests.swift`
-  - target dependency objects
-  - resources before sources build phase ordering
-  - products group for zero, one, and multiple targets
-  - `LastUpgradeCheck` defaulting and override behavior
-  - generated `Info.plist` build settings
-  - preserving explicit `INFOPLIST_FILE`
-  - generated entitlements build settings
-  - run script build phases
-  - custom build rules
-  - aggregate target dependencies and aggregate build scripts
-  - Swift static library Objective-C interface header copy phase
-  - local Swift package grouping and project exclusion
-  - weak target dependency build file settings
-  - source and dependency destination filters
-  - inferred source destination filters by path
-  - source build file settings for compiler flags, attributes, and resource tags
-  - framework/dynamic-library headers build phase and header visibility
-  - public static library header copy phase
-  - source `buildPhase` overrides for sources/resources/headers/none
-  - XcodeGen default file-type build phase classification
-  - bundle dependency resource copy phases, including destination filters and ignored custom copy specs
-  - embedded target dependency copy phases for frameworks, custom copy specs, and ExtensionKit defaults
-  - embedded framework, SDK, and Swift package dependency copy phases, including shared custom copy specs
-  - bundle identifier prefix defaults, development region, default configuration names, project SDK roots, deployment target defaults, and supported-destination build setting presets
-  - static framework embed defaults and explicit static framework embed overrides
-  - Objective-C linker flag propagation from explicit and implicit `requiresObjCLinking` target dependencies
-  - target attributes for provisioning style, development team, and test target references
-  - cyclic target dependency graph generation
-  - local Swift package custom groups, top-level placement, multiple products, Carthage static/dynamic search/copy behavior, project-level `findCarthageFrameworks`, custom `carthageBuildPath`, custom `carthageExecutablePath`, and Carthage copy-frameworks script inputs/outputs
-  - partial config settings and `settingPresets: none`
-  - source navigator groups, intermediate groups, custom groups, folder references with intermediate groups, duplicate display-name roots, relative outside-base groups, and Frameworks group emission
-- Selected `Tests/XcodeGenKitTests/SourceGeneratorTests.swift`
-  - source/resource build phase classification
-  - Xcode synchronized folder roots, target attachment, deduping, explicit folders, membership exceptions, and `Info.plist` exceptions
-  - default synced-folder source directory type
-  - merged synced-folder explicit folders and per-target exception sets
-  - source renaming for explicit file sources
-  - default ignored source files and extensions
-  - bracket/range glob excludes such as `*.[hx]` and `file[2-3].a`
-  - includes with no matches
-  - folder reference sources
-  - localized `.intentdefinition` default and override build phases
-  - missing optional file/folder references and skipped missing optional groups
-  - custom `options.fileTypes` build phases, directory-as-file traversal, compiler flags, attributes, and resource tags
-  - known regions from `.lproj` folders and string catalog localizations
-  - project `knownAssetTags`
-- Selected `Tests/XcodeGenKitTests/SchemeGeneratorTests.swift`
-  - shared scheme file generation
-  - first runnable target selection
-  - target scheme config variants
-  - scheme and target-scheme environment variables
-  - storeKit configuration references
-  - test plans and code coverage targets
-  - target scheme pre/post actions
-  - launch/test custom LLDB init, custom working directory, ask-to-launch, GPU capture mode passthrough, and test-target location references
-  - launch command-line arguments and language/region attributes
-  - run/test macro expansion, testing-runnable macro fallback, local Swift package test target references, and profile ask-to-launch
-  - scheme management plist for hidden target schemes
-  - external project build and code coverage references
-  - watch app target schemes with remote runnable and host app build action
-- Selected `Tests/XcodeGenKitTests/BreakpointGeneratorTests.swift`
-  - shared breakpoint file generation for exception and file breakpoints
-  - non-buildable file references
-  - frameworks in sources copied to frameworks destination
-  - Core Data model and mapping model source phase classification
-  - duplicate source de-duping
-  - include filters, exclude filters, and exclude priority over includes
-  - configured and auto-detected `Info.plist` files omitted from resource phases
-  - destination filters and inferred destination filters
-  - compiler flags, attributes, and resource tags
-  - header file classification and header visibility for framework targets
-  - public static library headers copied to products include directory
-  - explicit source build phase overrides
-  - default file-type table for common source, resource, and unphased extensions
-- Selected `Tests/XcodeGenKitTests/ProjectGeneratorTests.swift`
-  - writing generated `Info.plist` files with XcodeGen default keys
-  - bundle target `Info.plist` generation without `CFBundleExecutable`
-  - writing generated entitlements files
+The executable inventory guard lives in `tests/upstream_test_inventory.rs`. It walks `upstream-xcodegen/Tests`, excludes `Tests/Fixtures`, extracts top-level Swift `func test...` methods, and asserts the inventory matches the ported list. This prevents us from silently missing a newly added upstream test method or carrying a stale mapping.
 
-Current local suite: 170 declared tests, 169 passing and 1 ignored golden fixture parity test.
+## Ported Coverage
 
-## Still To Port
+### Fixture Tests
 
-- Remaining `ProjectSpecTests/SpecLoadingTests.swift`
-  - storekit/test plan/build tool plugin edge cases
-  - warning validation behavior
-- Remaining `ProjectSpecTests/ProjectSpecTests.swift`
-  - remaining validation behavior
-  - JSON encoding behavior
-- `XcodeGenKitTests/*`
-  - source generator
-  - remaining PBX project generator
-  - project generator settings
-  - scheme generator
-  - breakpoint generator
-  - Carthage dependency resolver
-- Full fixture golden parity
-  - byte-for-byte `project.pbxproj`
-  - generated schemes
-  - full fixture-level generated plist parity
-  - breakpoint files
-  - SwiftPM metadata
-- Performance tests
+- `FixtureTests.testProjectFixture`
+- Rust coverage:
+  - `tests/upstream_fixtures.rs`
+  - fixture spec loading for the primary upstream fixture set
+  - fixture project writing for TestProject, AnotherProject, CarthageProject, SPM, and scheme fixtures
+  - byte-for-byte `project.pbxproj` equality for TestProject, AnotherProject, CarthageProject, SPM, and scheme fixtures
+  - scheme and breakpoint artifact existence checks
+
+### Performance Tests
+
+- `PerformanceTests.testLoading`
+- `PerformanceTests.testGeneration`
+- `PerformanceTests.testWriting`
+- `PerformanceTests.testFixtureDecoding`
+- `PerformanceTests.testCacheFileGeneration`
+- `PerformanceTests.testFixtureGeneration`
+- `PerformanceTests.testFixtureWriting`
+- Rust coverage:
+  - `tests/performance_tests.rs`
+  - ported as deterministic smoke tests for the same loading, generation, writing, fixture decoding, and cache-payload paths
+
+Note: XCTest `measure { ... }` timing assertions are not reproduced as Rust benchmark measurements in the normal test suite. The functional operations are covered and run under `cargo test`.
+
+### ProjectSpec Tests
+
+- `Dictionary+Extension_Tests.testRemovingNil_ShouldReturnNewDictionaryWithoutOptionalValues`
+- `InvalidConfigsFormatTests.testInvalidConfigsMappingFormat`
+- `ProjectSpecTests.testTargetType`
+- `ProjectSpecTests.testTargetFilename`
+- `ProjectSpecTests.testDeploymentTarget`
+- `ProjectSpecTests.testValidation`
+- `ProjectSpecTests.testJSONEncodable`
+- `SpecLoadingTests.testSpecLoaderDuplicateImports`
+- `SpecLoadingTests.testSpecLoader`
+- `SpecLoadingTests.testSpecLoaderLoadingJSON`
+- `SpecLoadingTests.testSpecWarningValidation`
+- `SpecLoadingTests.testProjectSpecParser`
+- `SpecLoadingTests.testPackagesVersion`
+- `SpecLoadingTests.testDecoding`
+- Rust coverage:
+  - `src/spec.rs` unit tests
+  - `tests/upstream_fixtures.rs`
+  - null/empty removal, target type metadata, target filenames, deployment target formatting, validation, JSON/YAML loading, includes, relative path rewriting, warning validation, package version validation, template/environment expansion, build scripts, build rules, plugins, aggregate targets, options, packages, target schemes, schemes, settings, plists, breakpoints, and fixture decoding
+
+### XcodeGenCore Tests
+
+- `ArrayExtensionsTests.*`
+- `AtomicTests.testSimultaneousWriteOrder`
+- `GlobTests.*`
+- `PathExtensionsTests.testPathRelativeToPath`
+- Rust coverage:
+  - `tests/core_tests.rs`
+  - sorted-array search/sorting semantics, atomic concurrent writes, relative paths, brace globs, direct access, Bash v3/v4 globstar behavior, Gradle globstar behavior, indexing/repeated iteration behavior, and blacklisted directories
+
+### XcodeGenKit Tests
+
+- `BreakpointGeneratorTests.testBreakpoints`
+- `CarthageDependencyResolverTests.*`
+- `PBXProjGeneratorTests.*`
+- `ProjectGeneratorTests.*`
+- `SchemeGeneratorTests.*`
+- `SourceGeneratorTests.testSourceGenerator`
+- Rust coverage:
+  - `tests/pbx_generator_tests.rs`
+  - `tests/scheme_writer_tests.rs`
+  - `tests/upstream_fixtures.rs`
+  - `tests/performance_tests.rs`
+
+Covered behavior includes:
+
+- breakpoint XML writing
+- Carthage default/custom build paths and executable paths
+- Carthage platform build paths, related framework discovery, deduping, sorting, top-level target dependency resolution, transitive/aggregate resolution, direct embedding, custom copy phases, and platform filtering
+- PBX group ordering, product groups, `LastUpgradeCheck`, platform dependencies, target dependencies, aggregate targets, run scripts, build rules, generated plists/entitlements, local/remote Swift packages, weak dependencies, source/dependency destination filters, target attributes, build-setting presets, copy/embed phases, headers phases, file-type classification, known regions, known asset tags, source groups, synced folders, folder references, include/exclude filters, optional sources, localized intent definitions, duplicate source handling, and all active fixture pbxproj goldens
+- ProjectGenerator options, config generation, aggregate targets, target generation, destination-filtered generation, platform-filtered dependencies, and custom dependency destinations
+- Scheme generation, last-upgrade-version default/override behavior, hidden target scheme management, target scheme variants, environment variables, command-line arguments, macro expansion, test plans, code coverage, external project references, watch app runnable behavior, checker toggles, screenshot capture settings, and location simulation
+
+## Maintenance Rule
+
+When updating the upstream XcodeGen checkout:
+
+1. Run `cargo test --test upstream_test_inventory`.
+2. If the inventory changes, add or intentionally retire the corresponding Rust coverage.
+3. Update `EXPECTED_UPSTREAM_TESTS` and keep `PORTED_UPSTREAM_TESTS` equal only when the new behavior is represented.
+4. Run full `cargo test`.

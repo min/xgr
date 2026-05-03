@@ -587,6 +587,51 @@ fn writer_generates_scheme_without_debugger_for_test_like_xcodegen() {
 }
 
 #[test]
+fn writer_generates_checker_toggles_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "CheckerToggles",
+            "targets": {
+                "App": {"type": "application", "platform": "iOS"},
+                "Tests": {"type": "unitTestBundle", "platform": "iOS"}
+            },
+            "schemes": {
+                "CheckerScheme": {
+                    "build": {"targets": {"App": "all"}},
+                    "run": {
+                        "config": "Debug",
+                        "disableMainThreadChecker": true,
+                        "stopOnEveryMainThreadCheckerIssue": true,
+                        "disableThreadPerformanceChecker": true
+                    },
+                    "test": {
+                        "config": "Debug",
+                        "targets": ["Tests"],
+                        "disableMainThreadChecker": true,
+                        "stopOnEveryMainThreadCheckerIssue": true
+                    }
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::write(&project, None).unwrap();
+    let scheme = fs::read_to_string(
+        generated
+            .project_path
+            .join("xcshareddata/xcschemes/CheckerScheme.xcscheme"),
+    )
+    .unwrap();
+    assert!(scheme.contains("LaunchAction buildConfiguration=\"Debug\""));
+    assert!(scheme.contains("disableMainThreadChecker=\"YES\""));
+    assert!(scheme.contains("stopOnEveryMainThreadCheckerIssue=\"YES\""));
+    assert!(scheme.contains("disableThreadPerformanceChecker=\"YES\""));
+    assert!(scheme.contains("TestAction buildConfiguration=\"Debug\""));
+}
+
+#[test]
 fn writer_generates_screenshot_capture_preferences_like_xcodegen() {
     let temp = tempfile::TempDir::new().unwrap();
     let project = project_from_json(

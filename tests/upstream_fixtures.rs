@@ -434,7 +434,7 @@ fn graph_writer_emits_real_pbx_sections_for_primary_fixture() {
         .contains("SwiftRoaringDynamic in Frameworks"));
     assert!(generated
         .pbxproj
-        .contains("productType = com.apple.product-type.application;"));
+        .contains("productType = \"com.apple.product-type.application\";"));
     assert!(!generated.pbxproj.contains("compatibility-manifest"));
 }
 
@@ -496,20 +496,37 @@ targets:
 }
 
 #[test]
-#[ignore = "enable once the PBX graph writer reaches byte-for-byte upstream fixture compatibility"]
 fn matches_upstream_generated_pbxproj_golden_files() {
     let root = upstream_root();
-    let mut loader = SpecLoader::default();
-    let project = loader
-        .load_project(
-            root.join("Tests/Fixtures/SPM/project.yml"),
-            None,
-            HashMap::new(),
-        )
-        .unwrap();
-    let generated = ProjectWriter::generate(&project);
-    let golden =
-        std::fs::read_to_string(root.join("Tests/Fixtures/SPM/SPM.xcodeproj/project.pbxproj"))
-            .expect("golden pbxproj should exist");
-    assert_eq!(generated.pbxproj, golden);
+    for (spec, golden) in [
+        (
+            "Tests/Fixtures/SPM/project.yml",
+            "Tests/Fixtures/SPM/SPM.xcodeproj/project.pbxproj",
+        ),
+        (
+            "Tests/Fixtures/CarthageProject/project.yml",
+            "Tests/Fixtures/CarthageProject/Project.xcodeproj/project.pbxproj",
+        ),
+        (
+            "Tests/Fixtures/TestProject/AnotherProject/project.yml",
+            "Tests/Fixtures/TestProject/AnotherProject/AnotherProject.xcodeproj/project.pbxproj",
+        ),
+        (
+            "Tests/Fixtures/TestProject/project.yml",
+            "Tests/Fixtures/TestProject/Project.xcodeproj/project.pbxproj",
+        ),
+        (
+            "Tests/Fixtures/scheme_test/test_project.yml",
+            "Tests/Fixtures/scheme_test/TestProject.xcodeproj/project.pbxproj",
+        ),
+    ] {
+        let mut loader = SpecLoader::default();
+        let project = loader
+            .load_project(root.join(spec), None, HashMap::new())
+            .unwrap();
+        let generated = ProjectWriter::generate(&project);
+        let golden =
+            std::fs::read_to_string(root.join(golden)).expect("golden pbxproj should exist");
+        assert_eq!(generated.pbxproj, golden, "{spec}");
+    }
 }

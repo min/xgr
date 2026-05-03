@@ -576,7 +576,7 @@ impl Project {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpecOptions {
     pub carthage_build_path: Option<String>,
     pub carthage_executable_path: Option<String>,
@@ -587,6 +587,7 @@ pub struct SpecOptions {
     pub deployment_target: DeploymentTarget,
     pub file_types: IndexMap<String, FileType>,
     pub find_carthage_frameworks: bool,
+    pub use_base_internationalization: bool,
     pub pre_gen_command: Option<String>,
     pub post_gen_command: Option<String>,
     pub scheme_path_prefix: Option<String>,
@@ -594,6 +595,42 @@ pub struct SpecOptions {
     pub default_config: Option<String>,
     pub minimum_xcodegen_version: Option<String>,
     pub setting_presets_none: bool,
+    pub transitively_link_dependencies: bool,
+    pub group_sort_position: GroupSortPosition,
+    pub group_ordering: Vec<GroupOrdering>,
+    pub uses_tabs: Option<bool>,
+    pub indent_width: Option<i64>,
+    pub tab_width: Option<i64>,
+}
+
+impl Default for SpecOptions {
+    fn default() -> Self {
+        Self {
+            carthage_build_path: None,
+            carthage_executable_path: None,
+            create_intermediate_groups: false,
+            default_source_directory_type: None,
+            bundle_id_prefix: None,
+            development_language: None,
+            deployment_target: DeploymentTarget::default(),
+            file_types: IndexMap::new(),
+            find_carthage_frameworks: false,
+            use_base_internationalization: true,
+            pre_gen_command: None,
+            post_gen_command: None,
+            scheme_path_prefix: None,
+            local_packages_group: None,
+            default_config: None,
+            minimum_xcodegen_version: None,
+            setting_presets_none: false,
+            transitively_link_dependencies: false,
+            group_sort_position: GroupSortPosition::Top,
+            group_ordering: Vec::new(),
+            uses_tabs: None,
+            indent_width: None,
+            tab_width: None,
+        }
+    }
 }
 
 impl SpecOptions {
@@ -613,6 +650,8 @@ impl SpecOptions {
             deployment_target: DeploymentTarget::from_value(map.get("deploymentTarget")),
             file_types: parse_file_types(map.get("fileTypes")),
             find_carthage_frameworks: boolish(map.get("findCarthageFrameworks")).unwrap_or(false),
+            use_base_internationalization: boolish(map.get("useBaseInternationalization"))
+                .unwrap_or(true),
             pre_gen_command: string_at(map, "preGenCommand"),
             post_gen_command: string_at(map, "postGenCommand"),
             scheme_path_prefix: string_at(map, "schemePathPrefix"),
@@ -621,8 +660,37 @@ impl SpecOptions {
             minimum_xcodegen_version: scalar_to_string(map.get("minimumXcodeGenVersion")),
             setting_presets_none: string_at(map, "settingPresets")
                 .is_some_and(|value| value == "none"),
+            transitively_link_dependencies: boolish(map.get("transitivelyLinkDependencies"))
+                .unwrap_or(false),
+            group_sort_position: GroupSortPosition::from_value(map.get("groupSortPosition")),
+            group_ordering: parse_group_ordering(map.get("groupOrdering")),
+            uses_tabs: boolish(map.get("usesTabs")),
+            indent_width: map.get("indentWidth").and_then(Value::as_i64),
+            tab_width: map.get("tabWidth").and_then(Value::as_i64),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GroupSortPosition {
+    #[default]
+    Top,
+    Bottom,
+}
+
+impl GroupSortPosition {
+    fn from_value(value: Option<&Value>) -> Self {
+        match scalar_to_string(value).as_deref() {
+            Some("bottom") => Self::Bottom,
+            _ => Self::Top,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupOrdering {
+    pub pattern: Option<String>,
+    pub order: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -692,6 +760,7 @@ pub struct AggregateTarget {
     pub settings_spec: Settings,
     pub config_files: IndexMap<String, String>,
     pub build_scripts: Vec<BuildScript>,
+    pub build_tool_plugins: Vec<BuildToolPlugin>,
     pub scheme: Option<TargetScheme>,
     pub raw: Value,
 }
@@ -1153,6 +1222,8 @@ pub struct Target {
     pub attributes: Value,
     pub only_copy_files_on_install: bool,
     pub put_resources_before_sources_build_phase: bool,
+    pub transitively_link_dependencies: Option<bool>,
+    pub directly_embed_carthage_dependencies: Option<bool>,
     pub requires_objc_linking: Option<bool>,
     pub raw: JsonMap,
 }
@@ -1236,6 +1307,10 @@ impl Target {
                 map.get("putResourcesBeforeSourcesBuildPhase"),
             )
             .unwrap_or(false),
+            transitively_link_dependencies: boolish(map.get("transitivelyLinkDependencies")),
+            directly_embed_carthage_dependencies: boolish(
+                map.get("directlyEmbedCarthageDependencies"),
+            ),
             requires_objc_linking: boolish(map.get("requiresObjCLinking")),
             raw: map,
         })
@@ -1680,7 +1755,10 @@ pub enum ProductType {
     Bundle,
     UnitTestBundle,
     UiTestBundle,
+    OcUnitTestBundle,
     AppExtension,
+    XcodeExtension,
+    IntentsServiceExtension,
     CommandLineTool,
     WatchApp,
     Watch2App,
@@ -1691,6 +1769,8 @@ pub enum ProductType {
     MessagesExtension,
     StickerPack,
     XpcService,
+    InstrumentsPackage,
+    MetalLibrary,
     SystemExtension,
     ExtensionKitExtension,
     DriverExtension,
@@ -1709,7 +1789,12 @@ impl ProductType {
             "bundle" => Self::Bundle,
             "unit-test" | "unitTestBundle" | "bundle.unit-test" => Self::UnitTestBundle,
             "ui-testing" | "uiTestBundle" | "bundle.ui-testing" => Self::UiTestBundle,
+            "ocUnitTestBundle" | "bundle.ocunit-test" => Self::OcUnitTestBundle,
             "app-extension" | "appExtension" => Self::AppExtension,
+            "xcodeExtension" | "xcode-extension" => Self::XcodeExtension,
+            "intentsServiceExtension" | "intents-service-extension" => {
+                Self::IntentsServiceExtension
+            }
             "command-line" | "tool" | "commandLineTool" => Self::CommandLineTool,
             "watch-app" | "watchApp" => Self::WatchApp,
             "watch2App" | "watch2-app" | "application.watchapp2" => Self::Watch2App,
@@ -1726,6 +1811,8 @@ impl ProductType {
                 Self::StickerPack
             }
             "xpc-service" | "xpcService" => Self::XpcService,
+            "instrumentsPackage" | "instruments-package" => Self::InstrumentsPackage,
+            "metalLibrary" | "metal-library" => Self::MetalLibrary,
             "system-extension" | "systemExtension" => Self::SystemExtension,
             "extensionkit-extension" | "extensionKitExtension" => Self::ExtensionKitExtension,
             "driver-extension" | "driverExtension" => Self::DriverExtension,
@@ -1747,7 +1834,10 @@ impl ProductType {
             Self::StaticLibrary => Some("a"),
             Self::Bundle => Some("bundle"),
             Self::UnitTestBundle | Self::UiTestBundle => Some("xctest"),
+            Self::OcUnitTestBundle => Some("octest"),
             Self::AppExtension
+            | Self::XcodeExtension
+            | Self::IntentsServiceExtension
             | Self::WatchExtension
             | Self::Watch2Extension
             | Self::TvExtension
@@ -1755,6 +1845,8 @@ impl ProductType {
             | Self::StickerPack
             | Self::ExtensionKitExtension => Some("appex"),
             Self::XpcService => Some("xpc"),
+            Self::InstrumentsPackage => Some("instrpkg"),
+            Self::MetalLibrary => Some("metallib"),
             Self::SystemExtension => Some("systemextension"),
             Self::DriverExtension => Some("dext"),
             Self::CommandLineTool | Self::Other(_) => None,
@@ -2958,6 +3050,10 @@ fn parse_aggregate_targets(value: Option<&Value>) -> IndexMap<String, AggregateT
                     config_files: parse_string_map(target_map.get("configFiles"))
                         .unwrap_or_default(),
                     build_scripts: parse_build_scripts(target_map.get("buildScripts")),
+                    build_tool_plugins: parse_build_tool_plugins(
+                        target_map.get("buildToolPlugins"),
+                    )
+                    .unwrap_or_default(),
                     scheme: TargetScheme::from_value(target_map.get("scheme")),
                     raw: value.clone(),
                 },
@@ -3047,6 +3143,22 @@ fn parse_file_types(value: Option<&Value>) -> IndexMap<String, FileType> {
         }
     }
     file_types
+}
+
+fn parse_group_ordering(value: Option<&Value>) -> Vec<GroupOrdering> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let map = item.as_object()?;
+            Some(GroupOrdering {
+                pattern: string_at(map, "pattern"),
+                order: parse_string_array(map.get("order")),
+            })
+        })
+        .collect()
 }
 
 fn parse_schemes(value: Option<&Value>) -> IndexMap<String, Scheme> {
@@ -3717,6 +3829,7 @@ mod tests {
                 "App": {
                     "type": "application",
                     "platform": "iOS",
+                    "transitivelyLinkDependencies": true,
                     "dependencies": [
                         {"target": "name", "embed": false, "platformFilter": "all"},
                         {"target": "project/name", "embed": false, "platformFilter": "macOS"},
@@ -3737,6 +3850,10 @@ mod tests {
 
         let project = Project::from_dictionary(PathBuf::new(), dictionary).unwrap();
         let dependencies = &project.targets["App"].dependencies;
+        assert_eq!(
+            project.targets["App"].transitively_link_dependencies,
+            Some(true)
+        );
         assert_eq!(dependencies.len(), 8);
         assert_eq!(dependencies[0].dependency_type, DependencyType::Target);
         assert_eq!(dependencies[0].reference, "name");
@@ -4284,7 +4401,8 @@ mod tests {
                     "compilerFlags": ["c1", "c2"]
                 }},
                 "schemePathPrefix": "../",
-                "localPackagesGroup": "MyPackages"
+                "localPackagesGroup": "MyPackages",
+                "transitivelyLinkDependencies": true
             },
             "packages": {
                 "package1": {"url": "package.git", "exactVersion": "1.2.2"},
@@ -4324,6 +4442,7 @@ mod tests {
         );
         assert_eq!(options.file_types["abc"].compiler_flags, vec!["c1", "c2"]);
         assert_eq!(options.local_packages_group.as_deref(), Some("MyPackages"));
+        assert!(options.transitively_link_dependencies);
 
         assert_eq!(
             project.package_specs["package1"],
