@@ -1,0 +1,51 @@
+name: Bug Report
+description: Report a crash, invalid output, or other unexpected behavior.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please reduce private projects before attaching specs or generated files.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Include the smallest spec, fixture, or repository that reproduces the problem.
+      placeholder: |
+        1. Run `xgr generate --spec project.yml`
+        2. Open the generated project
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: Paste the exact command and relevant output.
+      render: sh
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: XcodeGenRust Version
+      description: Commit SHA, tag, or crate version.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Rust version, Xcode version if relevant.
+      placeholder: macOS 15.4, rustc 1.86.0, Xcode 16.3
+    validations:
+      required: false
