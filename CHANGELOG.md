@@ -30,9 +30,11 @@ This project is pre-1.0. Until a stable compatibility policy is published, minor
   cache is gone (load through `SpecFile::resolved_dictionary` instead).
 - `tests/performance_tests.rs` renamed to `tests/performance_smoke_tests.rs`
   to reflect that it is functional smoke coverage, not a benchmark.
-- Started splitting `src/pbxproj.rs` into a module directory; the
-  XcodeGen-reference-id pass now lives in `src/pbxproj/references.rs` and
-  the plist writer in `src/pbxproj/plist.rs`.
+- Split `src/pbxproj.rs` into a module directory: `pbxproj/{mod, graph,
+  plist, references, schemes}.rs`. `mod.rs` is now ~7,600 lines (down
+  from 8,725 monolith); the model + serializer live in `graph.rs`,
+  the plist writer in `plist.rs`, the XcodeGen-reference-id pass in
+  `references.rs`, and the scheme/breakpoint XML writers in `schemes.rs`.
 - `SpecError` lost six near-duplicate `UnknownBreakpoint*` variants in favor
   of a single `UnknownBreakpoint { kind: BreakpointField, value: String }`.
 - Crate-level rustdoc added for `lib.rs`.
