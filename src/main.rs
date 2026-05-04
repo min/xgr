@@ -45,9 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             variables,
         } => {
-            let mut loader = SpecLoader::default();
             let project =
-                loader.load_project(spec, project_root, variables.into_iter().collect())?;
+                SpecLoader::load_project(spec, project_root, variables.into_iter().collect())?;
             let generated = ProjectWriter::write(&project, output.as_deref())?;
             println!("{}", generated.project_path.display());
         }
@@ -57,8 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&project.raw)?);
         }
         Command::Validate { spec } => {
-            let mut loader = SpecLoader::default();
-            let project = loader.load_project(spec, None, HashMap::new())?;
+            let project = SpecLoader::load_project(spec, None, HashMap::new())?;
             println!(
                 "{}: {} targets, {} schemes",
                 project.name,

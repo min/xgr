@@ -33,7 +33,7 @@ The executable inventory guard lives in `tests/upstream_test_inventory.rs`. It w
 - `PerformanceTests.testFixtureGeneration`
 - `PerformanceTests.testFixtureWriting`
 - Rust coverage:
-  - `tests/performance_tests.rs`
+  - `tests/performance_smoke_tests.rs`
   - ported as deterministic smoke tests for the same loading, generation, writing, fixture decoding, and cache-payload paths
 
 Note: XCTest `measure { ... }` timing assertions are not reproduced as Rust benchmark measurements in the normal test suite. The functional operations are covered and run under `cargo test`.
@@ -81,7 +81,7 @@ Note: XCTest `measure { ... }` timing assertions are not reproduced as Rust benc
   - `tests/pbx_generator_tests.rs`
   - `tests/scheme_writer_tests.rs`
   - `tests/upstream_fixtures.rs`
-  - `tests/performance_tests.rs`
+  - `tests/performance_smoke_tests.rs`
 
 Covered behavior includes:
 

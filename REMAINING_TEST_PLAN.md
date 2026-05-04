@@ -12,7 +12,7 @@ The upstream XcodeGen test-porting pass is complete for the current checkout.
 
 ## Residual Notes
 
-- XCTest performance tests are represented as Rust smoke tests in `tests/performance_tests.rs`, not as benchmark timing assertions.
+- XCTest performance tests are represented as Rust smoke tests in `tests/performance_smoke_tests.rs`, not as benchmark timing assertions.
 - The upstream test inventory intentionally ignores helper functions and nested local functions, including the nested `func test(generateEmptyDirectories:)` helper inside `SourceGeneratorTests.swift`.
 - If upstream XcodeGen is updated, first run the inventory guard. A failure means the porting map must be updated before claiming parity again.
 

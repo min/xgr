@@ -131,7 +131,7 @@ fn upstream_test_methods() -> BTreeSet<String> {
 fn rust_counterparts(upstream_test: &str) -> &'static [&'static str] {
     match upstream_test {
         test if test.starts_with("FixtureTests/") => &["tests/upstream_fixtures.rs"],
-        test if test.starts_with("PerformanceTests/") => &["tests/performance_tests.rs"],
+        test if test.starts_with("PerformanceTests/") => &["tests/performance_smoke_tests.rs"],
         test if test.starts_with("ProjectSpecTests/Dictionary+Extension_Tests.swift") => {
             &["src/spec.rs"]
         }
