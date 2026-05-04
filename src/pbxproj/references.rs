@@ -1,6 +1,4 @@
-use super::graph::{
-    mapped_id, phase_name, xcode_reference_acronym, PbxObject, PbxValue,
-};
+use super::graph::{mapped_id, phase_name, xcode_reference_acronym, PbxObject, PbxValue};
 use super::{display_name, PbxGenerator};
 use md5::Digest;
 use std::collections::{HashMap, HashSet};
@@ -265,8 +263,11 @@ impl<'a> XcodeReferenceGenerator<'a> {
         };
         let config_list_isa = config_list.isa;
         let config_ids = array_refs(config_list, "buildConfigurations");
-        self.state
-            .fix(config_list_id, config_list_isa, &borrowed_slice(identifiers));
+        self.state.fix(
+            config_list_id,
+            config_list_isa,
+            &borrowed_slice(identifiers),
+        );
         for config_id in config_ids {
             let Some(config) = self.object(&config_id) else {
                 continue;

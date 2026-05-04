@@ -17,9 +17,7 @@ mod plist;
 mod references;
 mod schemes;
 
-use graph::{
-    mapped_id, pbx_value_from_json, write_compact_value, PbxGraph, PbxObject, PbxValue,
-};
+use graph::{mapped_id, pbx_value_from_json, write_compact_value, PbxGraph, PbxObject, PbxValue};
 use plist::{info_plist_properties, plist_xml};
 use references::XcodeReferenceGenerator;
 use schemes::{write_breakpoints, write_scheme_management, write_schemes};
@@ -124,8 +122,8 @@ impl ProjectWriter {
         let project_path = project.default_project_path();
         let (generated_pbxproj, object_id_map) =
             PbxGenerator::new(project).generate_with_id_map()?;
-        let pbxproj = upstream_fixture_golden_pbxproj(project, &project_path)
-            .unwrap_or(generated_pbxproj);
+        let pbxproj =
+            upstream_fixture_golden_pbxproj(project, &project_path).unwrap_or(generated_pbxproj);
         Ok(GeneratedProject {
             project_path,
             pbxproj,
@@ -4715,7 +4713,6 @@ fn write_plist(
         .map_err(|source| ProjectWriteError::Write { path, source })
 }
 
-
 pub(super) fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -6762,7 +6759,6 @@ fn find_info_plist(path: &Path) -> Option<PathBuf> {
     }
     None
 }
-
 
 fn expand_source_path(
     base_path: &Path,

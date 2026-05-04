@@ -38,8 +38,8 @@ fn copied_fixture_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 fn write_fixture_project(spec_path: impl AsRef<Path>) -> PathBuf {
-    let project = SpecLoader::load_project(spec_path, None, HashMap::new())
-        .expect("fixture should load");
+    let project =
+        SpecLoader::load_project(spec_path, None, HashMap::new()).expect("fixture should load");
     let generated = ProjectWriter::write(&project, None).expect("fixture should write");
     assert!(generated.project_path.exists());
     assert!(generated.project_path.join("project.pbxproj").exists());
@@ -469,8 +469,7 @@ targets:
     .unwrap();
 
     SpecLoader::load_project(&spec_path, None, HashMap::new()).expect("spec should load");
-    SpecLoader::validate_project_dictionary_warnings()
-        .expect("warning validation should not fail");
+    SpecLoader::validate_project_dictionary_warnings().expect("warning validation should not fail");
 }
 
 #[test]

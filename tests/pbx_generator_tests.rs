@@ -2406,11 +2406,15 @@ fn generator_places_local_swift_packages_at_top_level_like_xcodegen() {
         }),
     );
 
-    let generated_from_option = ProjectWriter::generate(&package_group_project).unwrap().pbxproj;
+    let generated_from_option = ProjectWriter::generate(&package_group_project)
+        .unwrap()
+        .pbxproj;
     assert!(generated_from_option.contains("path = ../Yams;"));
     assert!(!generated_from_option.contains("/* Packages */ = {"));
 
-    let generated_from_package = ProjectWriter::generate(&per_package_group_project).unwrap().pbxproj;
+    let generated_from_package = ProjectWriter::generate(&per_package_group_project)
+        .unwrap()
+        .pbxproj;
     assert!(generated_from_package.contains("path = ../XcodeGen;"));
     assert!(!generated_from_package.contains("/* Packages */ = {"));
 }

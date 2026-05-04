@@ -153,7 +153,8 @@ impl PbxValue {
                 } else {
                     output.push_str("{\n");
                     let mut values = values.iter().collect::<Vec<_>>();
-                    values.sort_by(|(a, _), (b, _)| mapped_id(a, id_map).cmp(&mapped_id(b, id_map)));
+                    values
+                        .sort_by(|(a, _), (b, _)| mapped_id(a, id_map).cmp(&mapped_id(b, id_map)));
                     for (key, value) in values {
                         write_tabs(output, indent + 1);
                         let key = mapped_id(key, id_map);

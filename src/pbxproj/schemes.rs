@@ -86,7 +86,10 @@ pub(super) fn write_scheme_management(
         .map_err(|source| ProjectWriteError::Write { path, source })
 }
 
-pub(super) fn write_breakpoints(project: &Project, project_path: &Path) -> Result<(), ProjectWriteError> {
+pub(super) fn write_breakpoints(
+    project: &Project,
+    project_path: &Path,
+) -> Result<(), ProjectWriteError> {
     if project.breakpoints.is_empty() {
         return Ok(());
     }

@@ -35,8 +35,8 @@ pub use spec::{
     CarthageLinkType, Dependency, DependencyType, DeploymentTarget, EnvironmentVariable,
     FileBuildPhase, FileType, GroupOrdering, GroupSortPosition, PackageVersionRequirement,
     Platform, PlatformFilter, Plist, ProductType, Project, Scheme, SchemeAction, SchemeBuild,
-    SchemeBuildTarget, SchemeExecutionAction, SchemeManagement, SchemeRun,
-    SchemeSimulateLocation, SchemeTest, SchemeTestTarget, Settings, SourceType, SpecError,
-    SpecFile, SpecLoader, SpecOptions, SpecValidationError, SwiftPackage, Target, TargetScheme,
-    TestPlan, ValidationError,
+    SchemeBuildTarget, SchemeExecutionAction, SchemeManagement, SchemeRun, SchemeSimulateLocation,
+    SchemeTest, SchemeTestTarget, Settings, SourceType, SpecError, SpecFile, SpecLoader,
+    SpecOptions, SpecValidationError, SwiftPackage, Target, TargetScheme, TestPlan,
+    ValidationError,
 };

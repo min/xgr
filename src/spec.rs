@@ -86,7 +86,10 @@ pub enum SpecError {
     #[error("invalid dependency {0}")]
     InvalidDependency(String),
     #[error("unknown breakpoint {kind} `{value}`")]
-    UnknownBreakpoint { kind: BreakpointField, value: String },
+    UnknownBreakpoint {
+        kind: BreakpointField,
+        value: String,
+    },
     #[error("invalid configs mapping format for keys: {0:?}")]
     InvalidConfigsMappingFormat(Vec<String>),
     #[error("invalid version `{0}`")]
@@ -1603,9 +1606,14 @@ impl Breakpoint {
     fn from_value(value: &Value) -> Result<Self, SpecError> {
         let map = value
             .as_object()
-            .ok_or_else(|| SpecError::UnknownBreakpoint { kind: BreakpointField::Type, value: value.to_string() })?;
-        let id = string_at(map, "type")
-            .ok_or_else(|| SpecError::UnknownBreakpoint { kind: BreakpointField::Type, value: String::new() })?;
+            .ok_or_else(|| SpecError::UnknownBreakpoint {
+                kind: BreakpointField::Type,
+                value: value.to_string(),
+            })?;
+        let id = string_at(map, "type").ok_or_else(|| SpecError::UnknownBreakpoint {
+            kind: BreakpointField::Type,
+            value: String::new(),
+        })?;
         let breakpoint_type = match id.as_str() {
             "File" | "FileBreakpoint" => BreakpointType::File {
                 path: string_at(map, "path").unwrap_or_default(),
@@ -1631,7 +1639,12 @@ impl Breakpoint {
             }
             "IDETestFailure" | "IDETestFailureBreakpoint" => BreakpointType::IdeTestFailure,
             "RuntimeIssue" | "RuntimeIssueBreakpoint" => BreakpointType::RuntimeIssue,
-            other => return Err(SpecError::UnknownBreakpoint { kind: BreakpointField::Type, value: other.to_owned() }),
+            other => {
+                return Err(SpecError::UnknownBreakpoint {
+                    kind: BreakpointField::Type,
+                    value: other.to_owned(),
+                })
+            }
         };
 
         Ok(Self {
@@ -3436,9 +3449,14 @@ fn parse_breakpoint_actions(value: Option<&Value>) -> Result<Vec<BreakpointActio
         .map(|value| {
             let map = value
                 .as_object()
-                .ok_or_else(|| SpecError::UnknownBreakpoint { kind: BreakpointField::ActionType, value: value.to_string() })?;
-            let id = string_at(map, "type")
-                .ok_or_else(|| SpecError::UnknownBreakpoint { kind: BreakpointField::ActionType, value: String::new() })?;
+                .ok_or_else(|| SpecError::UnknownBreakpoint {
+                    kind: BreakpointField::ActionType,
+                    value: value.to_string(),
+                })?;
+            let id = string_at(map, "type").ok_or_else(|| SpecError::UnknownBreakpoint {
+                kind: BreakpointField::ActionType,
+                value: String::new(),
+            })?;
             Ok(match id.as_str() {
                 "DebuggerCommand" => BreakpointAction::DebuggerCommand(string_at(map, "command")),
                 "Log" => BreakpointAction::Log {
@@ -3459,7 +3477,12 @@ fn parse_breakpoint_actions(value: Option<&Value>) -> Result<Vec<BreakpointActio
                 "Sound" => BreakpointAction::Sound(parse_breakpoint_sound(
                     string_at(map, "sound").as_deref().unwrap_or("Basso"),
                 )?),
-                other => return Err(SpecError::UnknownBreakpoint { kind: BreakpointField::ActionType, value: other.to_owned() }),
+                other => {
+                    return Err(SpecError::UnknownBreakpoint {
+                        kind: BreakpointField::ActionType,
+                        value: other.to_owned(),
+                    })
+                }
             })
         })
         .collect()
@@ -3470,7 +3493,10 @@ fn parse_breakpoint_scope(value: &str) -> Result<BreakpointScope, SpecError> {
         "all" => Ok(BreakpointScope::All),
         "objective-c" => Ok(BreakpointScope::ObjectiveC),
         "c++" => Ok(BreakpointScope::Cpp),
-        other => Err(SpecError::UnknownBreakpoint { kind: BreakpointField::Scope, value: other.to_owned() }),
+        other => Err(SpecError::UnknownBreakpoint {
+            kind: BreakpointField::Scope,
+            value: other.to_owned(),
+        }),
     }
 }
 
@@ -3478,7 +3504,10 @@ fn parse_breakpoint_stop_on_style(value: &str) -> Result<BreakpointStopOnStyle, 
     match value.to_lowercase().as_str() {
         "throw" => Ok(BreakpointStopOnStyle::Throw),
         "catch" => Ok(BreakpointStopOnStyle::Catch),
-        other => Err(SpecError::UnknownBreakpoint { kind: BreakpointField::StopOnStyle, value: other.to_owned() }),
+        other => Err(SpecError::UnknownBreakpoint {
+            kind: BreakpointField::StopOnStyle,
+            value: other.to_owned(),
+        }),
     }
 }
 
