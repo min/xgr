@@ -37,7 +37,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: XcodeGenRust Version
+      label: xgr Version
       description: Commit SHA, tag, or crate version.
     validations:
       required: true

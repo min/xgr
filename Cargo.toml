@@ -8,7 +8,16 @@ repository = "https://github.com/min/xgr"
 readme = "README.md"
 keywords = ["xcode", "xcodegen", "ios", "macos", "project-generator"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".github/", ".context/", "upstream-xcodegen/"]
+exclude = [
+    ".github/",
+    ".context/",
+    "upstream-xcodegen/",
+    "Formula/",
+    "scripts/",
+    "BENCHMARKS.md",
+    "TEST_PARITY.md",
+    "REMAINING_TEST_PLAN.md",
+]
 
 [features]
 # Internal: only enabled by the upstream-fixture parity test, which compares
