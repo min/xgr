@@ -1,22 +1,16 @@
 <p align="center">
-  <img src="assets/logo-readme.png" width="144" alt="XcodeGenRust logo">
+  <img src="assets/logo-readme.png" width="180" alt="XGR logo">
 </p>
 
-# XcodeGenRust
+# XGR
 
-`XcodeGenRust` is a Rust implementation of XcodeGen-compatible `project.yml` loading and `.xcodeproj` generation. The CLI is `xgr`.
+`xgr` is a Rust implementation of XcodeGen-compatible `project.yml` loading and `.xcodeproj` generation.
 
 The goal is practical parity with [`yonaskolb/XcodeGen`](https://github.com/yonaskolb/XcodeGen): load the same project specs, generate deterministic Xcode project files, and keep behavior covered by upstream fixture tests.
 
-Naming:
-
-- Project: `XcodeGenRust`
-- Crate: `xcodegenrust`
-- CLI: `xgr`
-
 ## Status
 
-`XcodeGenRust` is pre-1.0 software. It is intended for compatibility testing, automation experiments, and projects that can compare generated output before adopting it. It should not be treated as a drop-in replacement for upstream XcodeGen without checking the generated `.xcodeproj` in your repository.
+`XGR` is pre-1.0 software. It is intended for compatibility testing, automation experiments, and projects that can compare generated output before adopting it. It should not be treated as a drop-in replacement for upstream XcodeGen without checking the generated `.xcodeproj` in your repository.
 
 Implemented:
 
@@ -46,8 +40,8 @@ Known limitations:
 ## Install With Homebrew
 
 ```sh
-brew tap min/xcodegen-rs https://github.com/min/xcodegen-rs
-brew install xcodegen-rs
+brew tap min/xgr https://github.com/min/xgr
+brew install xgr
 ```
 
 This installs the `xgr` CLI.
@@ -55,8 +49,8 @@ This installs the `xgr` CLI.
 ## Install From Source
 
 ```sh
-git clone --recurse-submodules https://github.com/min/xcodegen-rs.git
-cd xcodegen-rs
+git clone --recurse-submodules https://github.com/min/xgr.git
+cd xgr
 cargo build --release --locked
 ```
 

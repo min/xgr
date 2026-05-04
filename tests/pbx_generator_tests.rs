@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::fs;
-use xcodegenrust::{Project, ProjectWriter};
+use xgr::{Project, ProjectWriter};
 
 fn project_from_json(base_path: std::path::PathBuf, value: Value) -> Project {
     Project::from_dictionary(base_path, value.as_object().unwrap().clone()).unwrap()

@@ -10,11 +10,11 @@
 //!
 //! ```no_run
 //! use std::collections::HashMap;
-//! use xcodegenrust::{ProjectWriter, SpecLoader};
+//! use xgr::{ProjectWriter, SpecLoader};
 //!
 //! let project = SpecLoader::load_project("project.yml", None, HashMap::new())?;
 //! ProjectWriter::write(&project, None)?;
-//! # Ok::<(), xcodegenrust::ProjectWriteError>(())
+//! # Ok::<(), xgr::ProjectWriteError>(())
 //! ```
 //!
 //! See `README.md` and `TEST_PARITY.md` for the upstream-XcodeGen

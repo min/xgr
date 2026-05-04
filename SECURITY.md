@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-`XcodeGenRust` is pre-1.0. Report security issues against the current `main` branch.
+`XGR` is pre-1.0. Report security issues against the current `main` branch.
 
 ## Reporting a Vulnerability
 

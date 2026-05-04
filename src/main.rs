@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use xcodegenrust::{Project, ProjectWriter, SpecFile, SpecLoader};
+use xgr::{Project, ProjectWriter, SpecFile, SpecLoader};
 
 #[derive(Debug, Parser)]
 #[command(name = "xgr")]

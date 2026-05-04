@@ -1,10 +1,10 @@
 [package]
-name = "xcodegenrust"
+name = "xgr"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Rust port of XcodeGen's project.yml spec loader and project generator"
-repository = "https://github.com/min/xcodegen-rs"
+repository = "https://github.com/min/xgr"
 readme = "README.md"
 keywords = ["xcode", "xcodegen", "ios", "macos", "project-generator"]
 categories = ["command-line-utilities", "development-tools"]
@@ -17,7 +17,7 @@ exclude = [".github/", ".context/", "upstream-xcodegen/"]
 __upstream-fixture-golden = []
 
 [lib]
-name = "xcodegenrust"
+name = "xgr"
 path = "src/lib.rs"
 
 [[bin]]

@@ -76,7 +76,7 @@ pub(super) fn write_scheme_management(
     if states.is_empty() {
         return Ok(());
     }
-    let schemes_dir = project_path.join("xcuserdata/xcodegenrust.xcuserdatad/xcschemes");
+    let schemes_dir = project_path.join("xcuserdata/xgr.xcuserdatad/xcschemes");
     fs::create_dir_all(&schemes_dir).map_err(|source| ProjectWriteError::Write {
         path: schemes_dir.clone(),
         source,

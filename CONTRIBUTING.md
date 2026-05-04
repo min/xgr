@@ -1,14 +1,14 @@
 # Contributing
 
-Thanks for helping improve `XcodeGenRust`. The project goal is practical compatibility with upstream XcodeGen, so changes should preserve deterministic output and include focused tests for any behavior difference.
+Thanks for helping improve `XGR`. The project goal is practical compatibility with upstream XcodeGen, so changes should preserve deterministic output and include focused tests for any behavior difference.
 
 ## Setup
 
 Clone with submodules:
 
 ```sh
-git clone --recurse-submodules https://github.com/min/XcodeGenRust.git
-cd XcodeGenRust
+git clone --recurse-submodules https://github.com/min/xgr.git
+cd xgr
 ```
 
 If you already cloned without submodules:
