@@ -6,9 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub type JsonMap = Map<String, Value>;
+pub(crate) type JsonMap = Map<String, Value>;
 
-pub fn remove_empty_arrays_dictionaries_and_nulls(value: Value) -> Value {
+#[allow(dead_code)]
+pub(crate) fn remove_empty_arrays_dictionaries_and_nulls(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let filtered = map
@@ -43,7 +44,7 @@ pub fn remove_empty_arrays_dictionaries_and_nulls(value: Value) -> Value {
     }
 }
 
-pub fn format_deployment_target(value: impl ToString) -> Result<String, SpecError> {
+pub(crate) fn format_deployment_target(value: impl ToString) -> Result<String, SpecError> {
     let value = value.to_string();
     let parts = value.split('.').collect::<Vec<_>>();
     if parts.is_empty()
@@ -84,22 +85,35 @@ pub enum SpecError {
     InvalidTargetPlatformAsArray,
     #[error("invalid dependency {0}")]
     InvalidDependency(String),
-    #[error("unknown breakpoint type `{0}`")]
-    UnknownBreakpointType(String),
-    #[error("unknown breakpoint scope `{0}`")]
-    UnknownBreakpointScope(String),
-    #[error("unknown breakpoint stop-on style `{0}`")]
-    UnknownBreakpointStopOnStyle(String),
-    #[error("unknown breakpoint action type `{0}`")]
-    UnknownBreakpointActionType(String),
-    #[error("unknown breakpoint action conveyance type `{0}`")]
-    UnknownBreakpointActionConveyanceType(String),
-    #[error("unknown breakpoint action sound name `{0}`")]
-    UnknownBreakpointActionSoundName(String),
+    #[error("unknown breakpoint {kind} `{value}`")]
+    UnknownBreakpoint { kind: BreakpointField, value: String },
     #[error("invalid configs mapping format for keys: {0:?}")]
     InvalidConfigsMappingFormat(Vec<String>),
     #[error("invalid version `{0}`")]
     InvalidVersion(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakpointField {
+    Type,
+    Scope,
+    StopOnStyle,
+    ActionType,
+    ActionConveyanceType,
+    ActionSoundName,
+}
+
+impl std::fmt::Display for BreakpointField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Type => "type",
+            Self::Scope => "scope",
+            Self::StopOnStyle => "stop-on style",
+            Self::ActionType => "action type",
+            Self::ActionConveyanceType => "action conveyance type",
+            Self::ActionSoundName => "action sound name",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -374,17 +388,17 @@ impl SpecFile {
         spec
     }
 
-    fn merge_unique(&self, seen: &mut HashSet<PathBuf>) -> JsonMap {
+    fn merge_unique(self, seen: &mut HashSet<PathBuf>) -> JsonMap {
         let path = normalize_path(self.base_path.join(&self.file_path));
         if !seen.insert(path) {
             return JsonMap::new();
         }
 
         let mut merged = JsonMap::new();
-        for sub_spec in &self.sub_specs {
+        for sub_spec in self.sub_specs {
             merged = merge_maps(sub_spec.merge_unique(seen), merged);
         }
-        merge_maps(self.dictionary.clone(), merged)
+        merge_maps(self.dictionary, merged)
     }
 }
 
@@ -1578,9 +1592,9 @@ impl Breakpoint {
     fn from_value(value: &Value) -> Result<Self, SpecError> {
         let map = value
             .as_object()
-            .ok_or_else(|| SpecError::UnknownBreakpointType(value.to_string()))?;
+            .ok_or_else(|| SpecError::UnknownBreakpoint { kind: BreakpointField::Type, value: value.to_string() })?;
         let id = string_at(map, "type")
-            .ok_or_else(|| SpecError::UnknownBreakpointType(String::new()))?;
+            .ok_or_else(|| SpecError::UnknownBreakpoint { kind: BreakpointField::Type, value: String::new() })?;
         let breakpoint_type = match id.as_str() {
             "File" | "FileBreakpoint" => BreakpointType::File {
                 path: string_at(map, "path").unwrap_or_default(),
@@ -1606,7 +1620,7 @@ impl Breakpoint {
             }
             "IDETestFailure" | "IDETestFailureBreakpoint" => BreakpointType::IdeTestFailure,
             "RuntimeIssue" | "RuntimeIssueBreakpoint" => BreakpointType::RuntimeIssue,
-            other => return Err(SpecError::UnknownBreakpointType(other.to_owned())),
+            other => return Err(SpecError::UnknownBreakpoint { kind: BreakpointField::Type, value: other.to_owned() }),
         };
 
         Ok(Self {
@@ -1908,26 +1922,21 @@ impl Platform {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct SpecLoader {
-    pub project_dictionary: Option<JsonMap>,
-}
+#[derive(Debug)]
+pub struct SpecLoader;
 
 impl SpecLoader {
     pub fn load_project(
-        &mut self,
         path: impl AsRef<Path>,
         project_root: Option<PathBuf>,
         variables: HashMap<String, String>,
     ) -> Result<Project, SpecError> {
         let spec = SpecFile::load_with_options(path, project_root, variables)?;
         let dictionary = spec.resolved_dictionary();
-        let project = Project::from_dictionary(spec.base_path.clone(), dictionary.clone())?;
-        self.project_dictionary = Some(dictionary);
-        Ok(project)
+        Project::from_dictionary(spec.base_path.clone(), dictionary)
     }
 
-    pub fn validate_project_dictionary_warnings(&self) -> Result<(), SpecError> {
+    pub fn validate_project_dictionary_warnings() -> Result<(), SpecError> {
         Ok(())
     }
 }
@@ -1947,11 +1956,12 @@ fn load_dictionary(path: &Path) -> Result<JsonMap, SpecError> {
             message: error.to_string(),
         })?
     } else {
-        let yaml =
-            serde_yaml::from_str::<serde_yaml::Value>(&data).map_err(|error| SpecError::Parse {
+        let yaml = serde_norway::from_str::<serde_norway::Value>(&data).map_err(|error| {
+            SpecError::Parse {
                 path: path.to_path_buf(),
                 message: error.to_string(),
-            })?;
+            }
+        })?;
         serde_json::to_value(yaml).map_err(|error| SpecError::Parse {
             path: path.to_path_buf(),
             message: error.to_string(),
@@ -2473,10 +2483,16 @@ fn expand_variables_in_map(map: &mut JsonMap, variables: &HashMap<String, String
     if variables.is_empty() {
         return;
     }
-    let old = std::mem::take(map);
-    for (key, mut value) in old {
-        expand_variables_in_value(&mut value, variables);
-        map.insert(expand_string(&key, variables), value);
+    if map.keys().any(|key| key.contains("${")) {
+        let old = std::mem::take(map);
+        for (key, mut value) in old {
+            expand_variables_in_value(&mut value, variables);
+            map.insert(expand_string(&key, variables), value);
+        }
+    } else {
+        for value in map.values_mut() {
+            expand_variables_in_value(value, variables);
+        }
     }
 }
 
@@ -2494,10 +2510,26 @@ fn expand_variables_in_value(value: &mut Value, variables: &HashMap<String, Stri
 }
 
 fn expand_string(string: &str, variables: &HashMap<String, String>) -> String {
-    let mut result = string.to_owned();
-    for (key, value) in variables {
-        result = result.replace(&format!("${{{key}}}"), value);
+    if !string.contains("${") {
+        return string.to_owned();
     }
+    let mut result = String::with_capacity(string.len());
+    let mut rest = string;
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        if let Some(end) = after_open.find('}') {
+            let key = &after_open[..end];
+            if let Some(value) = variables.get(key) {
+                result.push_str(value);
+                rest = &after_open[end + 1..];
+                continue;
+            }
+        }
+        result.push_str("${");
+        rest = after_open;
+    }
+    result.push_str(rest);
     result
 }
 
@@ -3393,9 +3425,9 @@ fn parse_breakpoint_actions(value: Option<&Value>) -> Result<Vec<BreakpointActio
         .map(|value| {
             let map = value
                 .as_object()
-                .ok_or_else(|| SpecError::UnknownBreakpointActionType(value.to_string()))?;
+                .ok_or_else(|| SpecError::UnknownBreakpoint { kind: BreakpointField::ActionType, value: value.to_string() })?;
             let id = string_at(map, "type")
-                .ok_or_else(|| SpecError::UnknownBreakpointActionType(String::new()))?;
+                .ok_or_else(|| SpecError::UnknownBreakpoint { kind: BreakpointField::ActionType, value: String::new() })?;
             Ok(match id.as_str() {
                 "DebuggerCommand" => BreakpointAction::DebuggerCommand(string_at(map, "command")),
                 "Log" => BreakpointAction::Log {
@@ -3416,7 +3448,7 @@ fn parse_breakpoint_actions(value: Option<&Value>) -> Result<Vec<BreakpointActio
                 "Sound" => BreakpointAction::Sound(parse_breakpoint_sound(
                     string_at(map, "sound").as_deref().unwrap_or("Basso"),
                 )?),
-                other => return Err(SpecError::UnknownBreakpointActionType(other.to_owned())),
+                other => return Err(SpecError::UnknownBreakpoint { kind: BreakpointField::ActionType, value: other.to_owned() }),
             })
         })
         .collect()
@@ -3427,7 +3459,7 @@ fn parse_breakpoint_scope(value: &str) -> Result<BreakpointScope, SpecError> {
         "all" => Ok(BreakpointScope::All),
         "objective-c" => Ok(BreakpointScope::ObjectiveC),
         "c++" => Ok(BreakpointScope::Cpp),
-        other => Err(SpecError::UnknownBreakpointScope(other.to_owned())),
+        other => Err(SpecError::UnknownBreakpoint { kind: BreakpointField::Scope, value: other.to_owned() }),
     }
 }
 
@@ -3435,7 +3467,7 @@ fn parse_breakpoint_stop_on_style(value: &str) -> Result<BreakpointStopOnStyle, 
     match value.to_lowercase().as_str() {
         "throw" => Ok(BreakpointStopOnStyle::Throw),
         "catch" => Ok(BreakpointStopOnStyle::Catch),
-        other => Err(SpecError::UnknownBreakpointStopOnStyle(other.to_owned())),
+        other => Err(SpecError::UnknownBreakpoint { kind: BreakpointField::StopOnStyle, value: other.to_owned() }),
     }
 }
 
@@ -3443,9 +3475,10 @@ fn parse_breakpoint_conveyance(value: &str) -> Result<BreakpointLogConveyanceTyp
     match value.to_lowercase().as_str() {
         "console" => Ok(BreakpointLogConveyanceType::Console),
         "speak" => Ok(BreakpointLogConveyanceType::Speak),
-        other => Err(SpecError::UnknownBreakpointActionConveyanceType(
-            other.to_owned(),
-        )),
+        other => Err(SpecError::UnknownBreakpoint {
+            kind: BreakpointField::ActionConveyanceType,
+            value: other.to_owned(),
+        }),
     }
 }
 
@@ -3465,9 +3498,10 @@ fn parse_breakpoint_sound(value: &str) -> Result<BreakpointSound, SpecError> {
         "Sosumi" => Ok(BreakpointSound::Sosumi),
         "Submarine" => Ok(BreakpointSound::Submarine),
         "Tink" => Ok(BreakpointSound::Tink),
-        other => Err(SpecError::UnknownBreakpointActionSoundName(
-            other.to_owned(),
-        )),
+        other => Err(SpecError::UnknownBreakpoint {
+            kind: BreakpointField::ActionSoundName,
+            value: other.to_owned(),
+        }),
     }
 }
 

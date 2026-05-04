@@ -23,8 +23,8 @@ Run these before opening a pull request:
 
 ```sh
 cargo fmt
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-features --locked
 ```
 
 If `cargo-audit` is installed, also run:
@@ -32,6 +32,12 @@ If `cargo-audit` is installed, also run:
 ```sh
 cargo audit --deny warnings
 ```
+
+The `--all-features` flag enables the internal `__upstream-fixture-golden` cargo
+feature, which gates the upstream XcodeGen fixture-parity test
+(`tests/upstream_fixtures.rs`). Default `cargo test` skips that suite, which is
+fine for casual development but not sufficient for a pull request — CI runs
+with the feature on.
 
 ## Compatibility Changes
 

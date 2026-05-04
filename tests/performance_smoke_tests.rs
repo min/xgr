@@ -31,10 +31,7 @@ targets:
 }
 
 fn load_project(spec_path: impl AsRef<Path>) -> xcodegenrust::Project {
-    let mut loader = SpecLoader::default();
-    loader
-        .load_project(spec_path, None, HashMap::new())
-        .expect("project should load")
+    SpecLoader::load_project(spec_path, None, HashMap::new()).expect("project should load")
 }
 
 #[test]
@@ -52,7 +49,7 @@ fn generated_performance_loading_case_is_ported_as_smoke_test() {
 fn generated_performance_generation_case_is_ported_as_smoke_test() {
     let (_temp, spec_path) = sample_project();
     let project = load_project(spec_path);
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("isa = PBXProject;"));
     assert!(generated.pbxproj.contains("App.swift in Sources"));
 }
@@ -82,16 +79,10 @@ fn fixture_performance_decoding_case_is_ported_as_smoke_test() {
 #[test]
 fn fixture_performance_cache_file_generation_case_is_ported_as_smoke_test() {
     let spec_path = upstream_root().join("Tests/Fixtures/TestProject/project.yml");
-    let mut loader = SpecLoader::default();
-    loader
-        .load_project(spec_path, None, HashMap::new())
-        .expect("project should load");
-    let dictionary = loader
-        .project_dictionary
-        .as_ref()
-        .expect("resolved dictionary should be retained");
+    let spec = SpecFile::load(&spec_path).expect("spec should load");
+    let dictionary = spec.resolved_dictionary();
     let cache_payload =
-        serde_json::to_string(dictionary).expect("resolved dictionary should serialize");
+        serde_json::to_string(&dictionary).expect("resolved dictionary should serialize");
     assert!(cache_payload.contains("App_iOS"));
 }
 
@@ -99,7 +90,7 @@ fn fixture_performance_cache_file_generation_case_is_ported_as_smoke_test() {
 fn fixture_performance_generation_case_is_ported_as_smoke_test() {
     let spec_path = upstream_root().join("Tests/Fixtures/TestProject/project.yml");
     let project = load_project(spec_path);
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("isa = PBXProject;"));
     assert!(generated.pbxproj.contains("App_iOS"));
 }

@@ -65,7 +65,7 @@ fn generator_generates_bundle_identifier_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("PRODUCT_BUNDLE_IDENTIFIER = com.test.MyFramework;"));
@@ -116,7 +116,7 @@ fn generator_applies_group_ordering_at_top_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert_names_in_order(
         main_group_children_block(&generated),
         &[
@@ -182,7 +182,7 @@ fn generator_applies_group_ordering_at_bottom_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert_names_in_order(
         group_children_block_with_path(&generated, "MainScreen"),
         &[
@@ -238,7 +238,7 @@ fn generator_applies_group_ordering_to_local_packages_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert_names_in_order(
         main_group_children_block(&generated),
         &["Sources", "Resources", "Tests", "Packages", "Products"],
@@ -285,7 +285,7 @@ fn generator_sorts_synced_folders_with_group_ordering_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert_names_in_order(
         main_group_children_block(&generated),
         &["Sources", "SyncedSources", "Resources", "Products"],
@@ -305,7 +305,7 @@ fn generator_generates_development_language_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("developmentRegion = de;"));
     assert!(generated.pbxproj.contains("knownRegions = ("));
     assert!(generated.pbxproj.contains("\t\t\t\tde,"));
@@ -338,7 +338,7 @@ fn generator_uses_default_configuration_name_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -369,7 +369,7 @@ fn generator_applies_partial_config_settings_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("name = \"Staging Debug\";"));
     assert!(generated.contains("SETTING1 = VALUE1;"));
     assert!(generated.contains("SETTING2 = VALUE2;"));
@@ -397,7 +397,7 @@ fn generator_sets_project_sdkroot_for_single_platform_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("SDKROOT = iphoneos;"));
 }
 
@@ -424,7 +424,7 @@ fn generator_sets_platform_deployment_targets_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -466,7 +466,7 @@ fn generator_sets_supported_destinations_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("SDKROOT = auto;"));
     assert!(generated.pbxproj.contains(
         "SUPPORTED_PLATFORMS = \"iphoneos iphonesimulator appletvos appletvsimulator\";"
@@ -616,7 +616,7 @@ fn generator_merges_supported_destination_presets_like_xcodegen() {
                 }
             }),
         );
-        let generated = ProjectWriter::generate(&project).pbxproj;
+        let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
 
         assert!(generated.contains(&format!("SUPPORTED_PLATFORMS = \"{supported_platforms}\";")));
         if device_family.contains(',') {
@@ -679,7 +679,7 @@ fn generator_respects_setting_presets_none_for_supported_destinations_like_xcode
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("SDKROOT = auto;"));
     assert!(!generated.contains("SUPPORTED_PLATFORMS"));
     assert!(!generated.contains("TARGETED_DEVICE_FAMILY"));
@@ -709,7 +709,7 @@ fn generator_clears_setting_presets_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("SDKROOT = iphoneos;"));
     assert!(generated.contains("SETTING_2 = VALUE;"));
     assert!(!generated.contains("TARGETED_DEVICE_FAMILY"));
@@ -741,7 +741,7 @@ fn generator_adds_files_to_correct_build_phases_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("App.swift in Sources"));
     assert!(generated.pbxproj.contains("ViewController.m in Sources"));
     assert!(generated.pbxproj.contains("Assets.xcassets in Resources"));
@@ -774,7 +774,7 @@ fn generator_supports_frameworks_in_sources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("Bar.swift in Sources"));
     assert!(generated.pbxproj.contains("isa = PBXCopyFilesBuildPhase;"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
@@ -803,7 +803,7 @@ fn generator_emits_synced_folder_sources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("isa = PBXFileSystemSynchronizedRootGroup;"));
@@ -836,7 +836,7 @@ fn generator_emits_source_groups_in_main_navigator_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("/* Sources */ = {"));
     assert!(generated.pbxproj.contains("path = Sources;"));
     assert!(generated.pbxproj.contains("path = Nested;"));
@@ -873,7 +873,7 @@ fn generator_emits_intermediate_source_groups_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("path = Sources;"));
     assert!(generated.contains("path = A;"));
     assert!(generated.contains("path = F;"));
@@ -916,7 +916,7 @@ fn generator_emits_custom_source_groups_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("path = CustomGroup1;"));
     assert!(generated.contains("path = Sources/a.swift;"));
     assert!(generated.contains("path = Sources/A/b.swift;"));
@@ -949,7 +949,7 @@ fn generator_emits_folder_references_with_intermediate_groups_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("path = Sources;"));
     assert!(generated.contains("path = Sources/A;"));
     assert!(generated.contains("lastKnownFileType = folder;"));
@@ -991,7 +991,7 @@ fn generator_keeps_distinct_source_groups_with_the_same_display_name_like_xcodeg
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     let main_children = main_group_children_block(&generated);
     assert_eq!(main_children.matches("/* B */").count(), 2);
     assert!(generated.contains("path = B;"));
@@ -1030,7 +1030,7 @@ fn generator_groups_relative_sources_outside_base_path_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("path = Sources;"));
     assert!(generated.contains("path = Inside;"));
     assert!(generated.contains("path = Inside2;"));
@@ -1062,7 +1062,7 @@ fn generator_respects_default_source_directory_type_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("isa = PBXFileSystemSynchronizedRootGroup;"));
@@ -1097,7 +1097,7 @@ fn generator_deduplicates_synced_folders_across_targets_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -1141,7 +1141,7 @@ fn generator_merges_synced_folder_explicit_folders_across_targets_like_xcodegen(
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -1182,7 +1182,7 @@ fn generator_adds_synced_folder_membership_exceptions_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("isa = PBXFileSystemSynchronizedBuildFileExceptionSet;"));
@@ -1220,7 +1220,7 @@ fn generator_adds_synced_folder_include_exceptions_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("a.swift,"));
     assert!(generated.pbxproj.contains("Nested/c.swift,"));
     assert!(!generated.pbxproj.contains("Nested/b.swift,"));
@@ -1261,7 +1261,7 @@ fn generator_keeps_separate_synced_folder_exceptions_per_target_like_xcodegen() 
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -1303,7 +1303,7 @@ fn generator_expands_synced_folder_explicit_folders_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("explicitFolders = ("));
     assert!(generated.pbxproj.contains("Images,"));
     assert!(generated.pbxproj.contains("MainSuite/FeatureATests,"));
@@ -1344,7 +1344,7 @@ fn generator_treats_core_data_mapping_models_as_sources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("model.xcmappingmodel in Sources"));
@@ -1370,7 +1370,7 @@ fn generator_deduplicates_sources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(generated.pbxproj.matches("A.swift in Sources").count(), 2);
 }
 
@@ -1394,7 +1394,7 @@ fn generator_renames_explicit_file_sources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("c.swift in Sources"));
     assert!(generated.pbxproj.contains("name = c.swift;"));
     assert!(generated.pbxproj.contains("path = OtherSource/b.swift;"));
@@ -1423,7 +1423,7 @@ fn generator_excludes_default_ignored_files_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("a.swift in Sources"));
     assert!(!generated.pbxproj.contains(".DS_Store"));
     assert!(!generated.pbxproj.contains("a.swift.orig"));
@@ -1458,7 +1458,7 @@ fn generator_supports_bracket_globs_in_source_excludes_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("a.swift in Sources"));
     assert!(generated.pbxproj.contains("a.m in Sources"));
     assert!(generated.pbxproj.contains("file1.a in Resources"));
@@ -1490,7 +1490,7 @@ fn generator_emits_folder_reference_sources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("A in Resources"));
     assert!(generated.pbxproj.contains("lastKnownFileType = folder;"));
     assert!(generated.pbxproj.contains("path = Sources/A;"));
@@ -1520,7 +1520,7 @@ fn generator_adds_missing_optional_files_and_folders_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("File1.swift in Sources"));
     assert!(generated.pbxproj.contains("File2.swift in Sources"));
     assert!(generated.pbxproj.contains("Group in Resources"));
@@ -1548,7 +1548,7 @@ fn generator_allows_missing_optional_groups_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(!generated.pbxproj.contains("path = Group1;"));
     assert!(!generated.pbxproj.contains("path = Group2;"));
     assert!(!generated.pbxproj.contains("path = Group3;"));
@@ -1599,7 +1599,7 @@ fn generator_includes_only_matching_sources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("file2Tests.swift in Sources"));
     assert!(generated.pbxproj.contains("file3Tests.swift in Sources"));
     assert!(generated.pbxproj.contains("fileTests.swift in Sources"));
@@ -1635,7 +1635,7 @@ fn generator_handles_includes_with_no_matches_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(!generated.pbxproj.contains("file2.swift in Sources"));
     assert!(!generated.pbxproj.contains("file3.swift in Sources"));
     assert!(!generated.pbxproj.contains("file2Tests.swift in Sources"));
@@ -1670,7 +1670,7 @@ fn generator_prioritizes_excludes_over_includes_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("file2Tests.swift in Sources"));
     assert!(generated.pbxproj.contains("file3Tests.swift in Sources"));
     assert!(!generated.pbxproj.contains("fileTests.swift in Sources"));
@@ -1697,7 +1697,7 @@ fn generator_places_resources_before_sources_when_requested_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     let resources_index = generated
         .pbxproj
         .find("/* Resources */")
@@ -1732,7 +1732,7 @@ fn generator_emits_target_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("isa = PBXTargetDependency;"));
     assert!(generated.pbxproj.contains("remoteInfo = Framework;"));
 }
@@ -1758,7 +1758,7 @@ fn generator_handles_cyclical_target_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("remoteInfo = target1;"));
     assert!(generated.pbxproj.contains("remoteInfo = target2;"));
     assert_eq!(
@@ -1783,7 +1783,7 @@ fn generator_sets_products_group_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("/* Products */"));
     assert!(generated.pbxproj.contains("path = TestApp.app;"));
     assert!(generated
@@ -1799,7 +1799,7 @@ fn generator_sets_empty_products_group_without_targets_like_xcodegen() {
         serde_json::json!({"name": "Products"}),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("/* Products */"));
     assert!(generated.pbxproj.contains("productRefGroup"));
 }
@@ -1810,7 +1810,7 @@ fn generator_sets_last_upgrade_check_like_xcodegen() {
         std::path::PathBuf::new(),
         serde_json::json!({"name": "Upgrade"}),
     );
-    let default_generated = ProjectWriter::generate(&default_project);
+    let default_generated = ProjectWriter::generate(&default_project).unwrap();
     assert!(default_generated
         .pbxproj
         .contains("LastUpgradeCheck = 1430;"));
@@ -1822,7 +1822,7 @@ fn generator_sets_last_upgrade_check_like_xcodegen() {
             "attributes": {"LastUpgradeCheck": "1234"}
         }),
     );
-    let overridden_generated = ProjectWriter::generate(&overridden_project);
+    let overridden_generated = ProjectWriter::generate(&overridden_project).unwrap();
     assert!(overridden_generated
         .pbxproj
         .contains("LastUpgradeCheck = 1234;"));
@@ -1834,7 +1834,7 @@ fn generator_sets_last_upgrade_check_like_xcodegen() {
             "attributes": {"LastUpgradeCheck": 1234}
         }),
     );
-    let invalid_generated = ProjectWriter::generate(&invalid_project);
+    let invalid_generated = ProjectWriter::generate(&invalid_project).unwrap();
     assert!(invalid_generated
         .pbxproj
         .contains("LastUpgradeCheck = 1430;"));
@@ -1873,7 +1873,7 @@ fn generator_emits_target_attributes_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("TargetAttributes = {"));
     assert!(generated.pbxproj.contains("DevelopmentTeam = 123;"));
     assert!(generated.pbxproj.contains("ProvisioningStyle = Automatic;"));
@@ -1942,7 +1942,7 @@ fn generator_does_not_override_explicit_info_plist_setting_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("INFOPLIST_FILE = Predefined.plist;"));
@@ -2032,7 +2032,7 @@ fn generator_omits_configured_info_plist_from_resources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("App.swift in Sources"));
     assert!(generated.pbxproj.contains("Info.plist"));
     assert!(!generated.pbxproj.contains("/* Info.plist in Resources */"));
@@ -2067,7 +2067,7 @@ fn generator_emits_run_script_phases_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -2116,7 +2116,7 @@ fn generator_emits_build_rules_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(generated.pbxproj.matches("isa = PBXBuildRule;").count(), 2);
     assert!(generated.pbxproj.contains("name = \"My Rule\";"));
     assert!(generated
@@ -2167,7 +2167,7 @@ fn generator_emits_aggregate_target_dependencies_and_scripts_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -2230,7 +2230,7 @@ fn generator_copies_swift_objc_interface_header_for_static_libraries_like_xcodeg
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -2269,7 +2269,7 @@ fn generator_honors_local_swift_package_group_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("/* MyPackages */"));
     assert!(generated
         .pbxproj
@@ -2302,7 +2302,7 @@ fn generator_excludes_local_swift_packages_from_project_when_requested_like_xcod
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(!generated
         .pbxproj
         .contains("isa = XCLocalSwiftPackageReference;"));
@@ -2333,7 +2333,7 @@ fn generator_places_local_swift_packages_in_custom_group_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("/* Packages */ = {"));
     assert!(generated.pbxproj.contains("/* Feature */ = {"));
     assert!(generated.pbxproj.contains("path = ../XcodeGen;"));
@@ -2379,11 +2379,11 @@ fn generator_places_local_swift_packages_at_top_level_like_xcodegen() {
         }),
     );
 
-    let generated_from_option = ProjectWriter::generate(&package_group_project).pbxproj;
+    let generated_from_option = ProjectWriter::generate(&package_group_project).unwrap().pbxproj;
     assert!(generated_from_option.contains("path = ../Yams;"));
     assert!(!generated_from_option.contains("/* Packages */ = {"));
 
-    let generated_from_package = ProjectWriter::generate(&per_package_group_project).pbxproj;
+    let generated_from_package = ProjectWriter::generate(&per_package_group_project).unwrap().pbxproj;
     assert!(generated_from_package.contains("path = ../XcodeGen;"));
     assert!(!generated_from_package.contains("/* Packages */ = {"));
 }
@@ -2411,7 +2411,7 @@ fn generator_links_multiple_swift_package_products_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("productName = FooDomain;"));
     assert!(generated.pbxproj.contains("productName = FooUI;"));
     assert!(generated.pbxproj.contains("FooDomain in Frameworks"));
@@ -2452,13 +2452,13 @@ fn generator_sets_carthage_search_paths_and_copy_phase_like_xcodegen() {
         }),
     );
 
-    let static_generated = ProjectWriter::generate(&static_project).pbxproj;
+    let static_generated = ProjectWriter::generate(&static_project).unwrap().pbxproj;
     assert!(static_generated.contains("FRAMEWORK_SEARCH_PATHS = ("));
     assert!(static_generated.contains("Carthage/Build/iOS/Static"));
     assert!(static_generated.contains("MyStaticFramework.framework in Frameworks"));
     assert!(!static_generated.contains("MyStaticFramework.framework in CopyFiles"));
 
-    let mixed_generated = ProjectWriter::generate(&mixed_project).pbxproj;
+    let mixed_generated = ProjectWriter::generate(&mixed_project).unwrap().pbxproj;
     assert!(mixed_generated.contains("Carthage/Build/iOS"));
     assert!(mixed_generated.contains("Carthage/Build/iOS/Static"));
     assert!(mixed_generated.contains("MyDynamicFramework.framework in Frameworks"));
@@ -2498,7 +2498,7 @@ fn generator_adds_only_matching_platform_carthage_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/Alamofire.framework"));
     assert!(generated.contains("Alamofire_watch.framework in Frameworks"));
     assert!(!generated.contains("$(SRCROOT)/Carthage/Build/iOS/Alamofire_watch.framework"));
@@ -2529,7 +2529,7 @@ fn generator_emits_frameworks_group_after_source_groups_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("/* Frameworks */ = {"));
     assert!(generated.contains("path = Alamofire.framework;"));
     assert!(generated.contains("path = A;"));
@@ -2582,7 +2582,7 @@ fn generator_sorts_source_groups_and_files_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert_names_in_order(
         main_group_children_block(&generated),
         &["/* A */", "/* B */", "/* B */", "/* S */", "/* Sources */"],
@@ -2622,7 +2622,7 @@ fn generator_uses_project_level_find_carthage_frameworks_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("FRAMEWORK_SEARCH_PATHS = ("));
     assert!(generated.contains("$(PROJECT_DIR)/Carthage/Build/iOS"));
 }
@@ -2660,7 +2660,7 @@ fn generator_resolves_related_carthage_frameworks_from_version_files_like_xcodeg
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("CarthageTestFixture.framework in Frameworks"));
     assert!(generated.contains("DependencyFixtureA.framework in Frameworks"));
     assert!(generated.contains("DependencyFixtureB.framework in Frameworks"));
@@ -2700,7 +2700,7 @@ fn generator_deduplicates_related_carthage_frameworks_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert_eq!(
         generated
             .matches("$(SRCROOT)/Carthage/Build/iOS/ReactiveSwift.framework")
@@ -2731,7 +2731,7 @@ fn generator_sorts_carthage_dependencies_for_copy_frameworks_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert_names_in_order(
         &generated,
         &[
@@ -2785,7 +2785,7 @@ fn generator_resolves_transitive_carthage_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/NestedFramework.framework"));
     assert!(!generated.contains("$(SRCROOT)/Carthage/Build/iOS/SkippedNestedFramework.framework"));
     assert!(!generated.contains("$(SRCROOT)/Carthage/Build/iOS/TvNestedFramework.framework"));
@@ -2821,7 +2821,7 @@ fn generator_resolves_carthage_dependencies_through_aggregate_targets_like_xcode
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("$(SRCROOT)/Carthage/Build/iOS/AggregateNestedFramework.framework"));
 }
 
@@ -2846,7 +2846,7 @@ fn generator_uses_custom_carthage_build_path_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("$(PROJECT_DIR)/Vendor/CarthageBuild/iOS/Static"));
     assert!(!generated.contains("$(PROJECT_DIR)/Carthage/Build/iOS/Static"));
 }
@@ -2872,7 +2872,7 @@ fn generator_uses_custom_carthage_executable_path_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("../bin/carthage copy-frameworks"));
     assert!(!generated.contains("shellScript = \"carthage copy-frameworks"));
 }
@@ -2897,7 +2897,7 @@ fn generator_directly_embeds_macos_carthage_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("name = \"Embed Frameworks\";"));
     assert!(generated.contains("dstSubfolderSpec = 10;"));
     assert!(generated.contains("frameworkA.framework in Embed Frameworks"));
@@ -2935,7 +2935,7 @@ fn generator_uses_custom_copy_phase_for_carthage_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("name = \"Embed Dependencies\";"));
     assert!(generated.contains("dstSubfolderSpec = 13;"));
     assert!(generated.contains("dstPath = test;"));
@@ -2963,7 +2963,7 @@ fn generator_honors_directly_embed_carthage_dependencies_override_like_xcodegen(
         }),
     );
 
-    let generated = ProjectWriter::generate(&project).pbxproj;
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
     assert!(generated.contains("carthage copy-frameworks"));
     assert!(generated.contains("$(SRCROOT)/Carthage/Build/Mac/frameworkA.framework"));
     assert!(!generated.contains("frameworkA.framework in Embed Frameworks"));
@@ -2990,7 +2990,7 @@ fn generator_emits_weak_target_dependency_build_file_settings_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("OptionalFramework.framework in Frameworks"));
@@ -3028,7 +3028,7 @@ fn generator_emits_source_destination_filters_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("iOS.swift in Sources"));
     assert!(generated.pbxproj.contains("Mac.swift in Sources"));
     assert!(generated.pbxproj.contains("platformFilters = ("));
@@ -3070,7 +3070,7 @@ fn generator_infers_source_destination_filters_by_path_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(generated.pbxproj.matches("platformFilters = (").count(), 8);
     assert_eq!(generated.pbxproj.matches("ios,").count(), 2);
     assert_eq!(generated.pbxproj.matches("tvos,").count(), 2);
@@ -3106,7 +3106,7 @@ fn generator_emits_dependency_destination_filters_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(generated.pbxproj.matches("platformFilters = (").count(), 7);
     assert_eq!(generated.pbxproj.matches("ios,").count(), 6);
     assert_eq!(generated.pbxproj.matches("tvos,").count(), 2);
@@ -3142,7 +3142,7 @@ fn generator_copies_bundle_dependencies_into_resources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("isa = PBXCopyFilesBuildPhase;"));
     assert!(generated
         .pbxproj
@@ -3186,7 +3186,7 @@ fn generator_ignores_custom_copy_phase_for_bundle_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("name = \"Copy Bundle Resources\";"));
@@ -3223,7 +3223,7 @@ fn generator_embeds_target_framework_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("isa = PBXCopyFilesBuildPhase;"));
     assert!(generated.pbxproj.contains("name = \"Embed Frameworks\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
@@ -3264,7 +3264,7 @@ fn generator_uses_custom_copy_phase_for_embedded_target_dependencies_like_xcodeg
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("isa = PBXCopyFilesBuildPhase;"));
     assert!(generated.pbxproj.contains("name = \"Embed Dependencies\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 13;"));
@@ -3298,7 +3298,7 @@ fn generator_embeds_extensionkit_dependencies_into_products_directory_like_xcode
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("isa = PBXCopyFilesBuildPhase;"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 16;"));
     assert!(generated
@@ -3333,7 +3333,7 @@ fn generator_embeds_xpc_service_dependencies_into_xpc_services_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 16;"));
     assert!(generated
         .pbxproj
@@ -3363,7 +3363,7 @@ fn generator_embeds_app_clip_dependencies_into_app_clips_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 16;"));
     assert!(generated
         .pbxproj
@@ -3395,7 +3395,7 @@ fn generator_embeds_xcode_and_intents_extensions_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 13;"));
     assert!(generated
         .pbxproj
@@ -3443,7 +3443,7 @@ fn generator_uses_custom_copy_phase_for_unembedded_product_types_like_xcodegen()
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("dstPath = test;"));
     assert!(generated
         .pbxproj
@@ -3475,7 +3475,7 @@ fn generator_embeds_framework_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("name = \"Embed Frameworks\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
     assert!(generated
@@ -3505,7 +3505,7 @@ fn generator_embeds_framework_dependencies_by_default_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("name = \"Embed Frameworks\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
     assert!(generated
@@ -3543,7 +3543,7 @@ fn generator_uses_single_custom_copy_phase_for_framework_dependencies_like_xcode
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(
         generated
             .pbxproj
@@ -3581,7 +3581,7 @@ fn generator_embeds_sdk_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("name = \"Embed Frameworks\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
     assert!(generated
@@ -3617,7 +3617,7 @@ fn generator_embeds_package_dependencies_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("name = \"Embed Frameworks\";"));
     assert!(generated.pbxproj.contains("dstSubfolderSpec = 10;"));
     assert!(generated.pbxproj.contains("RxSwift in Embed Frameworks"));
@@ -3645,7 +3645,7 @@ fn generator_embeds_app_extension_target_dependencies_by_default_like_xcodegen()
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("name = \"Embed Foundation Extensions\";"));
@@ -3697,7 +3697,7 @@ fn generator_does_not_embed_static_framework_targets_by_default_like_xcodegen() 
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     for linked in [
         "DynamicFramework.framework in Frameworks",
         "DynamicFrameworkNotEmbedded.framework in Frameworks",
@@ -3786,7 +3786,7 @@ fn generator_sets_objc_linker_flag_for_objc_linking_dependencies_like_xcodegen()
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert_eq!(generated.pbxproj.matches("-ObjC").count(), 4);
     assert!(generated.pbxproj.contains("OTHER_LDFLAGS = ("));
 }
@@ -3811,7 +3811,7 @@ fn generator_marks_embed_frameworks_copy_phase_only_on_install_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("FrameworkA.framework in Embed Frameworks"));
@@ -3838,7 +3838,7 @@ fn generator_marks_embed_app_extensions_copy_phase_only_on_install_like_xcodegen
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("AppExtension.appex in Embed Foundation Extensions"));
@@ -3879,7 +3879,7 @@ fn generator_emits_source_build_file_settings_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("COMPILER_FLAGS = \"-DDEBUG -warnings-as-errors\";"));
@@ -3928,7 +3928,7 @@ fn generator_emits_headers_build_phase_for_frameworks_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("isa = PBXHeadersBuildPhase;"));
     assert!(generated.pbxproj.contains("Public.h in Headers"));
     assert!(generated.pbxproj.contains("Private.hh in Headers"));
@@ -3960,7 +3960,7 @@ fn generator_drops_headers_phase_for_application_targets_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(!generated.pbxproj.contains("isa = PBXHeadersBuildPhase;"));
     assert!(!generated.pbxproj.contains("Public.h in Headers"));
 }
@@ -3990,7 +3990,7 @@ fn generator_copies_public_static_library_headers_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(!generated.pbxproj.contains("isa = PBXHeadersBuildPhase;"));
     assert!(generated.pbxproj.contains("isa = PBXCopyFilesBuildPhase;"));
     assert!(!generated.pbxproj.contains("name = \"Copy Headers\";"));
@@ -4031,7 +4031,7 @@ fn generator_respects_source_build_phase_overrides_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("Forced.swift in Resources"));
     assert!(generated.pbxproj.contains("Forced.h in Resources"));
     assert!(generated
@@ -4081,7 +4081,7 @@ fn generator_matches_xcodegen_default_file_type_build_phases() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("file.S in Sources"));
     assert!(generated.pbxproj.contains("file.metal in Sources"));
     assert!(generated.pbxproj.contains("file.mlmodel in Sources"));
@@ -4134,7 +4134,7 @@ fn generator_places_localized_intent_definitions_in_sources_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("Intents.intentdefinition in Sources"));
@@ -4170,7 +4170,7 @@ fn generator_respects_build_phase_for_localized_intent_definitions_like_xcodegen
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated
         .pbxproj
         .contains("Intents.intentdefinition in Resources"));
@@ -4223,7 +4223,7 @@ fn generator_applies_custom_file_type_properties_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("file.abc in Sources"));
     assert!(!generated.pbxproj.contains("file.a in Frameworks"));
     assert!(generated.pbxproj.contains("file.source1 in Sources"));
@@ -4282,7 +4282,7 @@ fn generator_detects_known_regions_from_lproj_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("knownRegions = ("));
     for region in ["Base", "en", "en-CA"] {
         let expected = if region.contains('-') {
@@ -4320,7 +4320,7 @@ fn generator_emits_known_asset_tags_like_xcodegen() {
         }),
     );
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     assert!(generated.pbxproj.contains("knownAssetTags = ("));
     assert!(generated.pbxproj.contains("tag1,"));
     assert!(generated.pbxproj.contains("tag2,"));

@@ -35,7 +35,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -44,4 +44,4 @@ jobs:
         run: cargo audit --deny warnings
 
       - name: Run tests
-        run: cargo test --locked
+        run: cargo test --all-features --locked

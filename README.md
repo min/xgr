@@ -114,10 +114,14 @@ When evaluating a real project, generate into a temporary path first and compare
 
 ```sh
 cargo fmt
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-features --locked
 cargo audit --deny warnings
 ```
+
+`--all-features` enables the internal `__upstream-fixture-golden` cargo feature
+that the upstream XcodeGen fixture-parity test depends on. Default
+`cargo test` skips that suite.
 
 Local benchmark artifacts should stay under `.context/bench`, which is ignored by git.
 

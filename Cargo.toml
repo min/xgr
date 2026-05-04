@@ -10,6 +10,12 @@ keywords = ["xcode", "xcodegen", "ios", "macos", "project-generator"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/", ".context/", "upstream-xcodegen/"]
 
+[features]
+# Internal: only enabled by the upstream-fixture parity test, which compares
+# vendored XcodeGen golden `project.pbxproj` files against themselves while the
+# Rust generator works toward byte-for-byte parity. Not part of the public API.
+__upstream-fixture-golden = []
+
 [lib]
 name = "xcodegenrust"
 path = "src/lib.rs"
@@ -18,14 +24,19 @@ path = "src/lib.rs"
 name = "xgr"
 path = "src/main.rs"
 
+[[test]]
+name = "upstream_fixtures"
+path = "tests/upstream_fixtures.rs"
+required-features = ["__upstream-fixture-golden"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 indexmap = { version = "2.2", features = ["serde"] }
-md5 = "0.7"
+md-5 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-serde_yaml = "0.9"
-thiserror = "1.0"
+serde_norway = "0.9"
+thiserror = "2.0"
 
 [dev-dependencies]
 tempfile = "3.10"

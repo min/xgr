@@ -1,18 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use xcodegenrust::spec::BuildScriptKind;
-use xcodegenrust::{ProjectWriter, SpecError, SpecLoader};
+use xcodegenrust::{BuildScriptKind, ProjectWriter, SpecError, SpecLoader};
 
 fn upstream_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("upstream-xcodegen")
 }
 
 fn load(path: impl AsRef<Path>) {
-    let mut loader = SpecLoader::default();
-    loader
-        .load_project(path, None, HashMap::new())
-        .expect("fixture should load");
+    SpecLoader::load_project(path, None, HashMap::new()).expect("fixture should load");
 }
 
 fn copy_dir_recursive(from: &Path, to: &Path) {
@@ -42,9 +38,7 @@ fn copied_fixture_dir(name: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 fn write_fixture_project(spec_path: impl AsRef<Path>) -> PathBuf {
-    let mut loader = SpecLoader::default();
-    let project = loader
-        .load_project(spec_path, None, HashMap::new())
+    let project = SpecLoader::load_project(spec_path, None, HashMap::new())
         .expect("fixture should load");
     let generated = ProjectWriter::write(&project, None).expect("fixture should write");
     assert!(generated.project_path.exists());
@@ -71,17 +65,15 @@ fn assert_fixture_sample_xctest_method(
     assert!(test_source.contains(&format!("class {class_name}: XCTestCase")));
     assert!(test_source.contains(&format!("func {method_name}()")));
 
-    let mut loader = SpecLoader::default();
-    let project = loader
-        .load_project(
-            root.join("Tests/Fixtures").join(fixture_spec),
-            None,
-            HashMap::new(),
-        )
-        .expect("fixture project should load");
+    let project = SpecLoader::load_project(
+        root.join("Tests/Fixtures").join(fixture_spec),
+        None,
+        HashMap::new(),
+    )
+    .expect("fixture project should load");
     assert!(project.targets.contains_key(target_name));
 
-    let generated = ProjectWriter::generate(&project);
+    let generated = ProjectWriter::generate(&project).unwrap();
     let file_name = Path::new(source_path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -265,14 +257,12 @@ fn writes_spm_project_fixture_like_xcodegen() {
 #[test]
 fn resolves_paths_relative_to_included_specs_like_xcodegen() {
     let root = upstream_root();
-    let mut loader = SpecLoader::default();
-    let project = loader
-        .load_project(
-            root.join("Tests/Fixtures/paths_test.yml"),
-            None,
-            HashMap::new(),
-        )
-        .unwrap();
+    let project = SpecLoader::load_project(
+        root.join("Tests/Fixtures/paths_test.yml"),
+        None,
+        HashMap::new(),
+    )
+    .unwrap();
 
     assert_eq!(
         project
@@ -349,18 +339,16 @@ fn resolves_paths_relative_to_included_specs_like_xcodegen() {
 #[test]
 fn expands_environment_and_template_variables_like_xcodegen() {
     let root = upstream_root();
-    let mut loader = SpecLoader::default();
-    let project = loader
-        .load_project(
-            root.join("Tests/Fixtures/variables_test.yml"),
-            None,
-            HashMap::from([
-                ("SETTING1".to_owned(), "ENV VALUE1".to_owned()),
-                ("SETTING4".to_owned(), "ENV VALUE4".to_owned()),
-                ("variable".to_owned(), "doesWin".to_owned()),
-            ]),
-        )
-        .unwrap();
+    let project = SpecLoader::load_project(
+        root.join("Tests/Fixtures/variables_test.yml"),
+        None,
+        HashMap::from([
+            ("SETTING1".to_owned(), "ENV VALUE1".to_owned()),
+            ("SETTING4".to_owned(), "ENV VALUE4".to_owned()),
+            ("variable".to_owned(), "doesWin".to_owned()),
+        ]),
+    )
+    .unwrap();
 
     assert_eq!(
         project
@@ -385,31 +373,27 @@ fn expands_environment_and_template_variables_like_xcodegen() {
 #[test]
 fn compatibility_writer_is_deterministic_for_primary_fixture() {
     let root = upstream_root();
-    let mut loader = SpecLoader::default();
-    let project = loader
-        .load_project(
-            root.join("Tests/Fixtures/SPM/project.yml"),
-            None,
-            HashMap::new(),
-        )
-        .unwrap();
-    let one = ProjectWriter::generate(&project);
-    let two = ProjectWriter::generate(&project);
+    let project = SpecLoader::load_project(
+        root.join("Tests/Fixtures/SPM/project.yml"),
+        None,
+        HashMap::new(),
+    )
+    .unwrap();
+    let one = ProjectWriter::generate(&project).unwrap();
+    let two = ProjectWriter::generate(&project).unwrap();
     assert_eq!(one.pbxproj, two.pbxproj);
 }
 
 #[test]
 fn graph_writer_emits_real_pbx_sections_for_primary_fixture() {
     let root = upstream_root();
-    let mut loader = SpecLoader::default();
-    let project = loader
-        .load_project(
-            root.join("Tests/Fixtures/SPM/project.yml"),
-            None,
-            HashMap::new(),
-        )
-        .unwrap();
-    let generated = ProjectWriter::generate(&project);
+    let project = SpecLoader::load_project(
+        root.join("Tests/Fixtures/SPM/project.yml"),
+        None,
+        HashMap::new(),
+    )
+    .unwrap();
+    let generated = ProjectWriter::generate(&project).unwrap();
 
     assert!(generated.pbxproj.starts_with("// !$*UTF8*$!"));
     assert!(generated.pbxproj.contains("isa = PBXProject;"));
@@ -447,14 +431,12 @@ fn invalid_configs_mapping_fixtures_fail_like_xcodegen() {
         "invalid_configs_value_non_mapping_aggregate_targets.yml",
         "invalid_configs_value_non_mapping_setting_groups.yml",
     ] {
-        let mut loader = SpecLoader::default();
-        let error = loader
-            .load_project(
-                root.join("Tests/Fixtures/invalid_configs").join(fixture),
-                None,
-                HashMap::new(),
-            )
-            .expect_err("fixture should fail");
+        let error = SpecLoader::load_project(
+            root.join("Tests/Fixtures/invalid_configs").join(fixture),
+            None,
+            HashMap::new(),
+        )
+        .expect_err("fixture should fail");
         assert!(matches!(
             error,
             SpecError::InvalidConfigsMappingFormat(keys)
@@ -486,12 +468,8 @@ targets:
     )
     .unwrap();
 
-    let mut loader = SpecLoader::default();
-    loader
-        .load_project(&spec_path, None, HashMap::new())
-        .expect("spec should load");
-    loader
-        .validate_project_dictionary_warnings()
+    SpecLoader::load_project(&spec_path, None, HashMap::new()).expect("spec should load");
+    SpecLoader::validate_project_dictionary_warnings()
         .expect("warning validation should not fail");
 }
 
@@ -520,11 +498,8 @@ fn matches_upstream_generated_pbxproj_golden_files() {
             "Tests/Fixtures/scheme_test/TestProject.xcodeproj/project.pbxproj",
         ),
     ] {
-        let mut loader = SpecLoader::default();
-        let project = loader
-            .load_project(root.join(spec), None, HashMap::new())
-            .unwrap();
-        let generated = ProjectWriter::generate_with_upstream_fixture_golden(&project);
+        let project = SpecLoader::load_project(root.join(spec), None, HashMap::new()).unwrap();
+        let generated = ProjectWriter::generate_with_upstream_fixture_golden(&project).unwrap();
         let golden =
             std::fs::read_to_string(root.join(golden)).expect("golden pbxproj should exist");
         assert_eq!(generated.pbxproj, golden, "{spec}");
