@@ -1,4 +1,4 @@
-# XcodeGenRust Upstream Test Plan
+# XGR Upstream Test Plan
 
 The upstream XcodeGen test-porting pass is complete for the current checkout.
 

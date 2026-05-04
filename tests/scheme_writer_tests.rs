@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::fs;
-use xcodegenrust::{Project, ProjectWriter};
+use xgr::{Project, ProjectWriter};
 
 fn project_from_json(base_path: std::path::PathBuf, value: Value) -> Project {
     Project::from_dictionary(base_path, value.as_object().unwrap().clone()).unwrap()
@@ -637,7 +637,7 @@ fn writer_generates_scheme_management_for_hidden_target_scheme_like_xcodegen() {
     let management = fs::read_to_string(
         generated
             .project_path
-            .join("xcuserdata/xcodegenrust.xcuserdatad/xcschemes/xcschememanagement.plist"),
+            .join("xcuserdata/xgr.xcuserdatad/xcschemes/xcschememanagement.plist"),
     )
     .unwrap();
     assert!(xml_contains(&management, "MyApp.xcscheme_^#shared#^_"));

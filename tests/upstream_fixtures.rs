@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use xcodegenrust::{BuildScriptKind, ProjectWriter, SpecError, SpecLoader};
+use xgr::{BuildScriptKind, ProjectWriter, SpecError, SpecLoader};
 
 fn upstream_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("upstream-xcodegen")
