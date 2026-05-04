@@ -156,7 +156,8 @@ impl PbxValue {
                     values.sort_by(|(a, _), (b, _)| mapped_id(a, id_map).cmp(&mapped_id(b, id_map)));
                     for (key, value) in values {
                         write_tabs(output, indent + 1);
-                        output.push_str(&mapped_id(key, id_map));
+                        let key = mapped_id(key, id_map);
+                        output.push_str(&quote_pbx_key(&key));
                         output.push_str(" = ");
                         value.write(output, indent + 1, comments, id_map);
                         output.push_str(";\n");
@@ -253,6 +254,14 @@ pub(super) fn phase_name(object: &PbxObject) -> Option<String> {
             Some(PbxValue::String(value)) => Some(value.clone()),
             _ => object.comment.clone().filter(|value| !value.is_empty()),
         },
+    }
+}
+
+pub(super) fn quote_pbx_key(value: &str) -> String {
+    if value.len() == 24 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        value.to_owned()
+    } else {
+        quote(value)
     }
 }
 
