@@ -1067,6 +1067,66 @@ fn generator_groups_relative_sources_outside_base_path_like_xcodegen() {
 }
 
 #[test]
+fn generator_keeps_source_group_paths_relative_to_custom_group_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("Packages/Mosaic/Tests/MosaicTests")).unwrap();
+    fs::write(
+        temp.path()
+            .join("Packages/Mosaic/Tests/MosaicTests/TestSupport.swift"),
+        "",
+    )
+    .unwrap();
+
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "CustomGroups",
+            "targets": {
+                "Tests": {
+                    "type": "bundle.unit-test",
+                    "platform": "iOS",
+                    "sources": [
+                        {"path": "Packages/Mosaic/Tests/MosaicTests", "group": "Packages"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
+    assert!(generated.contains("name = MosaicTests;"));
+    assert!(generated.contains("path = Mosaic/Tests/MosaicTests;"));
+    assert!(!generated.contains("path = Packages/Mosaic/Tests/MosaicTests;"));
+}
+
+#[test]
+fn generator_names_source_directory_roots_under_custom_groups_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("Tinker/Sources/App")).unwrap();
+    fs::write(temp.path().join("Tinker/Sources/App/App.swift"), "").unwrap();
+
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "CustomRootName",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": [
+                        {"path": "Tinker/Sources", "group": "Tinker"}
+                    ]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
+    assert!(generated.contains("name = Sources;"));
+    assert!(generated.contains("path = Sources;"));
+}
+
+#[test]
 fn generator_respects_default_source_directory_type_like_xcodegen() {
     let temp = tempfile::TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("Sources/A")).unwrap();
@@ -4292,6 +4352,8 @@ fn generator_matches_xcodegen_default_file_type_build_phases() {
         "file.gpx",
         "file.apns",
         "Plan.xctestplan",
+        "button-press.wav",
+        "MelonPop.ttf",
     ] {
         fs::write(temp.path().join("Sources").join(file), "").unwrap();
     }
@@ -4332,6 +4394,8 @@ fn generator_matches_xcodegen_default_file_type_build_phases() {
     assert!(!generated.pbxproj.contains("file.gpx in Resources"));
     assert!(!generated.pbxproj.contains("file.apns in Resources"));
     assert!(!generated.pbxproj.contains("Plan.xctestplan in Resources"));
+    assert!(generated.pbxproj.contains("lastKnownFileType = audio.wav;"));
+    assert!(generated.pbxproj.contains("lastKnownFileType = file;"));
 }
 
 #[test]
