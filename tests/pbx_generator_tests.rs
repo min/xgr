@@ -689,6 +689,33 @@ fn generator_respects_setting_presets_none_for_supported_destinations_like_xcode
 }
 
 #[test]
+fn generator_sets_destination_deployment_targets_for_supported_destinations() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "Generated",
+            "targets": {
+                "Framework": {
+                    "type": "framework",
+                    "platform": "auto",
+                    "supportedDestinations": ["iOS", "macOS", "visionOS"],
+                    "deploymentTarget": {
+                        "iOS": "16.0",
+                        "macOS": "14.0",
+                        "visionOS": "1.1"
+                    }
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).unwrap().pbxproj;
+    assert!(generated.contains("IPHONEOS_DEPLOYMENT_TARGET = 16.0;"));
+    assert!(generated.contains("MACOSX_DEPLOYMENT_TARGET = 14.0;"));
+    assert!(generated.contains("XROS_DEPLOYMENT_TARGET = 1.1;"));
+}
+
+#[test]
 fn generator_clears_setting_presets_like_xcodegen() {
     let project = project_from_json(
         std::path::PathBuf::new(),
@@ -1224,6 +1251,81 @@ fn generator_adds_synced_folder_include_exceptions_like_xcodegen() {
     assert!(generated.pbxproj.contains("a.swift,"));
     assert!(generated.pbxproj.contains("Nested/c.swift,"));
     assert!(!generated.pbxproj.contains("Nested/b.swift,"));
+}
+
+#[test]
+fn generator_adds_synced_folder_default_ignored_file_exceptions() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("Sources")).unwrap();
+    fs::write(temp.path().join("Sources/a.swift"), "").unwrap();
+    fs::write(temp.path().join("Sources/.DS_Store"), "").unwrap();
+    fs::write(temp.path().join("Sources/Debug.xcconfig"), "").unwrap();
+
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "SyncedFolders",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": [{"path": "Sources", "type": "syncedFolder"}]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).unwrap();
+    assert!(generated.pbxproj.contains(".DS_Store,"));
+    assert!(generated.pbxproj.contains("Debug.xcconfig,"));
+    assert!(!generated.pbxproj.contains("a.swift,"));
+}
+
+#[test]
+fn generator_uses_localized_synced_folder_membership_exceptions() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("Sources/de.lproj")).unwrap();
+    fs::create_dir_all(temp.path().join("Sources/fr.lproj")).unwrap();
+    fs::write(temp.path().join("Sources/App.swift"), "").unwrap();
+    fs::write(
+        temp.path().join("Sources/de.lproj/AppShortcuts.strings"),
+        "",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("Sources/fr.lproj/AppShortcuts.strings"),
+        "",
+    )
+    .unwrap();
+
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "SyncedFolders",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": [{
+                        "path": "Sources",
+                        "type": "syncedFolder",
+                        "includes": ["App.swift"]
+                    }]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).unwrap();
+    assert_eq!(
+        generated
+            .pbxproj
+            .matches("/Localized: AppShortcuts.strings")
+            .count(),
+        1
+    );
+    assert!(!generated.pbxproj.contains("de.lproj/AppShortcuts.strings"));
+    assert!(!generated.pbxproj.contains("fr.lproj/AppShortcuts.strings"));
 }
 
 #[test]
@@ -2034,6 +2136,72 @@ fn writer_executes_post_gen_command_like_xcodegen() {
         fs::read_to_string(generated.project_path.join("xcshareddata/generated.txt")).unwrap(),
         "copied"
     );
+}
+
+#[test]
+fn writer_executes_pre_gen_command_before_generation_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "PreGen",
+            "options": {
+                "preGenCommand": "mkdir -p Sources && printf 'import Foundation\n' > Sources/Generated.swift"
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": ["Sources"]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::write(&project, None).unwrap();
+
+    assert!(temp.path().join("Sources/Generated.swift").exists());
+    assert!(generated.pbxproj.contains("Generated.swift in Sources"));
+}
+
+#[test]
+fn writer_runs_project_commands_in_project_base_directory() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let output_dir = temp.path().join("Out");
+    fs::create_dir(&output_dir).unwrap();
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "CommandDirectory",
+            "options": {
+                "preGenCommand": "printf pre > pre.txt",
+                "postGenCommand": "printf post > post.txt"
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS"
+                }
+            }
+        }),
+    );
+
+    ProjectWriter::write(
+        &project,
+        Some(&output_dir.join("CommandDirectory.xcodeproj")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("pre.txt")).unwrap(),
+        "pre"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("post.txt")).unwrap(),
+        "post"
+    );
+    assert!(!output_dir.join("pre.txt").exists());
+    assert!(!output_dir.join("post.txt").exists());
 }
 
 #[test]
@@ -3401,6 +3569,36 @@ fn generator_embeds_app_clip_dependencies_into_app_clips_like_xcodegen() {
         .contains("dstPath = \"$(CONTENTS_FOLDER_PATH)/AppClips\";"));
     assert!(generated.pbxproj.contains("ClipA.app in Embed App Clips"));
     assert!(!generated.pbxproj.contains("ClipB.app in Embed App Clips"));
+}
+
+#[test]
+fn generator_embeds_watch_apps_into_plugins_for_xcode_26() {
+    let project = project_from_json(
+        std::path::PathBuf::new(),
+        serde_json::json!({
+            "name": "WatchEmbed",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "dependencies": [{"target": "WatchApp"}]
+                },
+                "WatchApp": {
+                    "type": "watch2App",
+                    "platform": "watchOS",
+                    "dependencies": [{"target": "WatchExtension"}]
+                },
+                "WatchExtension": {"type": "watch2Extension", "platform": "watchOS"}
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::generate(&project).unwrap();
+    assert!(generated
+        .pbxproj
+        .contains("WatchApp.app in Embed Watch Content"));
+    assert!(generated.pbxproj.contains("dstSubfolderSpec = 13;"));
+    assert!(!generated.pbxproj.contains("$(CONTENTS_FOLDER_PATH)/Watch"));
 }
 
 #[test]

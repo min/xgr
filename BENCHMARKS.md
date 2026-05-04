@@ -28,8 +28,8 @@ only.
 
 ```sh
 scripts/bench_public_xcodegen.sh
-scripts/bench_public_xcodegen.sh --only mapbox-maps-ios
-scripts/bench_public_xcodegen.sh --only element-ios --runs 10
+scripts/bench_public_xcodegen.sh --only element-ios
+scripts/bench_public_xcodegen.sh --only kiwix-apple --runs 10
 ```
 
 Artifacts are written under `.context/bench/public-xcodegen`:
@@ -49,9 +49,8 @@ Measured on this checkout with upstream XcodeGen 2.45.4 and `hyperfine --runs 5`
 
 | Candidate | XcodeGen mean | xgr mean | Speedup | `project.pbxproj` parity |
 | --- | ---: | ---: | ---: | --- |
-| `element-ios` | 1.303 s | 559.4 ms | 2.33x | differs |
-| `kiwix-apple` | 131.6 ms | 37.7 ms | 3.49x | byte-for-byte match |
-| `mapbox-maps-ios` | 352.9 ms | 143.2 ms | 2.46x | byte-for-byte match |
+| `element-ios` | 1.304 s | 624.3 ms | 2.09x | byte-for-byte match |
+| `kiwix-apple` | 129.2 ms | 43.9 ms | 2.94x | byte-for-byte match |
 
 The remaining candidates did not produce comparable benchmark timings in this
 environment:
@@ -61,5 +60,8 @@ environment:
   source directory.
 - `tutanota-calendar`: upstream XcodeGen required a missing generated
   `build-calendar-app` source directory.
-For `kiwix-apple` and `mapbox-maps-ios`, full `.xcodeproj` directory equality
-now matches byte-for-byte, including schemes and workspace metadata.
+- `mapbox-maps-ios`: upstream generation required a local Xcode/Carthage setup
+  that was not available in this environment.
+
+For `element-ios` and `kiwix-apple`, full `.xcodeproj` directory equality
+matches byte-for-byte, including schemes and workspace metadata.

@@ -6,7 +6,9 @@ This tracks upstream `yonaskolb/XcodeGen` test coverage ported into the Rust imp
 
 - Upstream top-level Swift test methods in this checkout: 75.
 - Rust porting status for those upstream methods: 75 accounted for.
-- Current Rust suite: 197 tests, all intended to run under `cargo test`.
+- Current Rust suite: 205 tests under `cargo test --all-features`; default
+  `cargo test` runs 181 tests and skips the feature-gated upstream fixture
+  golden test binary.
 - Fixture `project.pbxproj` parity: byte-for-byte equality is enforced for all checked upstream generated fixture goldens through an explicit test helper. The normal `ProjectWriter::generate` and CLI paths always run the Rust generator rather than reading fixture goldens.
 
 The executable inventory guard lives in `tests/upstream_test_inventory.rs`. It walks `upstream-xcodegen/Tests`, excludes `Tests/Fixtures`, extracts top-level Swift `func test...` methods, and asserts the inventory matches the ported list. This prevents us from silently missing a newly added upstream test method or carrying a stale mapping.

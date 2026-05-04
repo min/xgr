@@ -136,6 +136,10 @@ impl ProjectWriter {
         project: &Project,
         output: Option<&Path>,
     ) -> Result<GeneratedProject, ProjectWriteError> {
+        run_project_command(
+            &project.base_path,
+            project.spec_options.pre_gen_command.as_deref(),
+        )?;
         let mut generated = Self::generate(project)?;
         if let Some(output) = output {
             generated.project_path = output.to_path_buf();
@@ -170,22 +174,25 @@ impl ProjectWriter {
         write_schemes(project, &generated.project_path, &generated.object_id_map)?;
         write_scheme_management(project, &generated.project_path)?;
         write_breakpoints(project, &generated.project_path)?;
-        run_project_command(project, project.spec_options.post_gen_command.as_deref())?;
+        run_project_command(
+            &project.base_path,
+            project.spec_options.post_gen_command.as_deref(),
+        )?;
         Ok(generated)
     }
 }
 
-fn run_project_command(project: &Project, command: Option<&str>) -> Result<(), ProjectWriteError> {
+fn run_project_command(directory: &Path, command: Option<&str>) -> Result<(), ProjectWriteError> {
     let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
         return Ok(());
     };
     let output = Command::new("/bin/sh")
         .arg("-c")
         .arg(command)
-        .current_dir(&project.base_path)
+        .current_dir(directory)
         .output()
         .map_err(|source| ProjectWriteError::Write {
-            path: project.base_path.clone(),
+            path: directory.to_path_buf(),
             source,
         })?;
     if output.status.success() {
@@ -4440,6 +4447,32 @@ impl<'a> PbxGenerator<'a> {
         }
         if let Some(deployment_target) = target.deployment_target.as_deref() {
             insert_deployment_target(&mut settings, &target.platform, Some(deployment_target));
+        } else {
+            insert_deployment_target(
+                &mut settings,
+                &Platform::Ios,
+                target.deployment_targets.ios.as_deref(),
+            );
+            insert_deployment_target(
+                &mut settings,
+                &Platform::Macos,
+                target.deployment_targets.macos.as_deref(),
+            );
+            insert_deployment_target(
+                &mut settings,
+                &Platform::Tvos,
+                target.deployment_targets.tvos.as_deref(),
+            );
+            insert_deployment_target(
+                &mut settings,
+                &Platform::Watchos,
+                target.deployment_targets.watchos.as_deref(),
+            );
+            insert_deployment_target(
+                &mut settings,
+                &Platform::Visionos,
+                target.deployment_targets.visionos.as_deref(),
+            );
         }
         if let Some(search_paths) =
             carthage_framework_search_paths(&self.project.spec_options, target)
@@ -5814,8 +5847,8 @@ fn copy_files_settings_for_target_dependency(
             phase_order: CopyFilesPhaseOrder::PostCompile,
         }),
         ProductType::WatchApp | ProductType::Watch2App => Some(CopyFilesSettings {
-            dst_subfolder_spec: 16,
-            dst_path: "$(CONTENTS_FOLDER_PATH)/Watch".to_owned(),
+            dst_subfolder_spec: 13,
+            dst_path: String::new(),
             phase_name: "Embed Watch Content".to_owned(),
             phase_order: CopyFilesPhaseOrder::PostCompile,
         }),
@@ -6860,7 +6893,7 @@ fn synced_folder_membership_exceptions(
         return Vec::new();
     }
     let mut files = Vec::new();
-    collect_files(&source_root, &mut files, &indexmap::IndexMap::new());
+    collect_synced_folder_membership_files(&source_root, &mut files);
     let mut exceptions = files
         .into_iter()
         .filter_map(|file| {
@@ -6873,13 +6906,57 @@ fn synced_folder_membership_exceptions(
                 .join(&relative_to_source)
                 .to_string_lossy()
                 .into_owned();
-            (!source_matches_filters(&source_root, &file, source)
+            (synced_folder_default_membership_exception(&file)
+                || !source_matches_filters(&source_root, &file, source)
                 || info_plist_files.contains(&relative_to_project))
-            .then_some(relative_to_source)
+            .then(|| synced_folder_membership_exception_path(&relative_to_source))
         })
         .collect::<Vec<_>>();
     exceptions.sort();
+    exceptions.dedup();
     exceptions
+}
+
+fn collect_synced_folder_membership_files(path: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && synced_folder_default_membership_exception(&path) {
+            files.push(path);
+        } else if path.is_dir() && !is_wrapper_path(&path) {
+            collect_synced_folder_membership_files(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
+}
+
+fn synced_folder_default_membership_exception(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    (name.starts_with('.') && name != ".swiftlint.yml")
+        || name == "Carthage"
+        || name.ends_with(".xcodeproj")
+        || path.extension().and_then(|extension| extension.to_str()) == Some("orig")
+        || path.extension().and_then(|extension| extension.to_str()) == Some("xcconfig")
+}
+
+fn synced_folder_membership_exception_path(relative_to_source: &str) -> String {
+    let mut components = relative_to_source.split('/').collect::<Vec<_>>();
+    if let Some(index) = components.iter().position(|component| {
+        Path::new(component)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("lproj")
+    }) {
+        components.remove(index);
+        return format!("/Localized: {}", components.join("/"));
+    }
+    relative_to_source.to_owned()
 }
 
 fn model_current_version_name(model_group: &Path) -> Option<String> {
