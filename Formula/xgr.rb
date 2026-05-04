@@ -1,8 +1,6 @@
 class Xgr < Formula
   desc "Rust implementation of XcodeGen-compatible project generation"
   homepage "https://github.com/min/xgr"
-  url "https://github.com/min/xgr.git", branch: "main"
-  version "0.1.0"
   license "MIT"
 
   head "https://github.com/min/xgr.git", branch: "main"

@@ -5,7 +5,7 @@
 <h1 align="center">xgr</h1>
 
 <p align="center">
-  A Rust implementation of XcodeGen. Same <code>project.yml</code> specs, byte-for-byte <code>.xcodeproj</code> output, 2–3× faster on real projects.
+  A pre-1.0 Rust implementation of XcodeGen-compatible <code>project.yml</code> loading and <code>.xcodeproj</code> generation.
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-2021-orange.svg" alt="Rust 2021"></a>
 </p>
 
-`xgr` loads the same `project.yml` specs as [`yonaskolb/XcodeGen`](https://github.com/yonaskolb/XcodeGen) and generates the same `.xcodeproj` output, ported to Rust. The upstream XcodeGen Swift test inventory (75 methods) is ported and enforced; checked fixtures match upstream byte-for-byte.
+`xgr` is built to load the same `project.yml` specs as [`yonaskolb/XcodeGen`](https://github.com/yonaskolb/XcodeGen) and generate matching `.xcodeproj` output, ported to Rust. The upstream XcodeGen Swift test inventory (75 methods) is ported and enforced; checked fixtures match upstream byte-for-byte. Public benchmark runs are currently 2-3x faster on the measured projects in [`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Quickstart
 
@@ -69,11 +69,11 @@ See [`BENCHMARKS.md`](BENCHMARKS.md) for the public real-world comparison harnes
 
 ## Install
 
-### Homebrew
+### Homebrew HEAD
 
 ```sh
 brew tap min/xgr https://github.com/min/xgr
-brew install xgr
+brew install --HEAD xgr
 ```
 
 ### From source
@@ -90,7 +90,7 @@ If you cloned without submodules:
 git submodule update --init --recursive
 ```
 
-Published crates.io packages and binary release artifacts are not available yet. Source builds are the supported installation path until then.
+Published crates.io packages, stable Homebrew tarballs, and binary release artifacts are not available yet. Source builds and the Homebrew HEAD formula are the supported installation paths until then.
 
 ## Usage
 
