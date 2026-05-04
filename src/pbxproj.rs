@@ -449,6 +449,13 @@ impl<'a> PbxGenerator<'a> {
             "BuildIndependentTargetsInParallel".to_owned(),
             pbx_bool(true),
         );
+        if let Some(map) = self.project.attributes.as_object() {
+            for (key, value) in map {
+                if key != "LastUpgradeCheck" {
+                    attributes.insert(key.clone(), pbx_value_from_json(value));
+                }
+            }
+        }
         let target_attributes = self.target_attributes();
         attributes.insert(
             "TargetAttributes".to_owned(),
@@ -748,12 +755,12 @@ impl<'a> PbxGenerator<'a> {
                 phases.push(PbxValue::reference(frameworks_phase.clone(), "Frameworks"));
             }
         }
-        for (target_dependency_copy_phase, phase_name) in target_dependency_copy_phases {
-            phases.push(PbxValue::reference(
-                target_dependency_copy_phase,
-                phase_name,
-            ));
-        }
+        let mut dependency_copy_phases = target_dependency_copy_phases
+            .into_iter()
+            .chain(dependency_copy_phases)
+            .collect::<Vec<_>>();
+        dependency_copy_phases
+            .sort_by_key(|(_, phase_name)| copy_files_phase_name_order(phase_name));
         for (dependency_copy_phase, phase_name) in dependency_copy_phases {
             phases.push(PbxValue::reference(dependency_copy_phase, phase_name));
         }
@@ -2008,12 +2015,15 @@ impl<'a> PbxGenerator<'a> {
             comment,
             Some(file_path),
             last_known_file_type,
-            name.map(str::to_owned).filter(|value| {
-                *value != display_name(&relative)
-                    || Path::new(&relative)
-                        .parent()
-                        .is_some_and(|parent| !parent.as_os_str().is_empty())
-            }),
+            name.map(str::to_owned)
+                .or_else(|| is_localized_file(path).then(|| display_name(&relative)))
+                .filter(|value| {
+                    *value != display_name(&relative)
+                        || is_localized_file(path)
+                        || Path::new(&relative)
+                            .parent()
+                            .is_some_and(|parent| !parent.as_os_str().is_empty())
+                }),
             "<group>",
             true,
         )
@@ -3338,6 +3348,11 @@ impl<'a> PbxGenerator<'a> {
             }
         }
 
+        let mut buckets = buckets.into_iter().collect::<Vec<_>>();
+        buckets.sort_by_key(|((dst_subfolder_spec, dst_path, phase_name), _)| {
+            copy_files_phase_output_key(*dst_subfolder_spec, dst_path, phase_name)
+        });
+
         buckets
             .into_iter()
             .map(|((dst_subfolder_spec, dst_path, phase_name), files)| {
@@ -4279,7 +4294,7 @@ impl<'a> PbxGenerator<'a> {
         let info_plists = self.info_plist_files(target);
         for config in self.config_names() {
             let target_default_settings = self.target_default_build_settings(target, &config);
-            let settings = settings_by_config.entry(config).or_default();
+            let settings = settings_by_config.entry(config.clone()).or_default();
             for (key, value) in target_default_settings {
                 settings.entry(key).or_insert(value);
             }
@@ -4303,6 +4318,7 @@ impl<'a> PbxGenerator<'a> {
             if product_type_is_app(&target.target_type)
                 && self.target_dependencies_require_objc_linking(target)
                 && !settings.contains_key("OTHER_LDFLAGS")
+                && !target.config_files.contains_key(&config)
             {
                 settings.insert(
                     "OTHER_LDFLAGS".to_owned(),
@@ -4408,6 +4424,7 @@ impl<'a> PbxGenerator<'a> {
         if !self.project.spec_options.setting_presets_none {
             insert_project_setting_presets(&mut settings, config);
         }
+        self.remove_xcconfig_defined_defaults(&mut settings, self.project.config_files.get(config));
         settings
     }
 
@@ -4483,7 +4500,100 @@ impl<'a> PbxGenerator<'a> {
         if !self.project.spec_options.setting_presets_none {
             insert_target_setting_presets(&mut settings, target, config, self.project);
         }
+        self.remove_target_xcconfig_defined_defaults(
+            &mut settings,
+            self.project.config_files.get(config),
+        );
+        self.remove_target_xcconfig_defined_defaults(
+            &mut settings,
+            target.config_files.get(config),
+        );
         settings
+    }
+
+    fn remove_xcconfig_defined_defaults(
+        &self,
+        settings: &mut BTreeMap<String, PbxValue>,
+        config_file: Option<&String>,
+    ) {
+        let Some(config_file) = config_file else {
+            return;
+        };
+        for key in self.xcconfig_defined_keys(config_file) {
+            settings.remove(&key);
+        }
+    }
+
+    fn remove_target_xcconfig_defined_defaults(
+        &self,
+        settings: &mut BTreeMap<String, PbxValue>,
+        config_file: Option<&String>,
+    ) {
+        let Some(config_file) = config_file else {
+            return;
+        };
+        for key in self.xcconfig_defined_keys(config_file) {
+            if target_xcconfig_preserves_default(&key) {
+                continue;
+            }
+            settings.remove(&key);
+        }
+    }
+
+    fn xcconfig_defined_keys(&self, config_file: &str) -> HashSet<String> {
+        let mut keys = HashSet::new();
+        let mut seen = HashSet::new();
+        self.collect_xcconfig_defined_keys(
+            &self.project.base_path.join(config_file),
+            &mut seen,
+            &mut keys,
+        );
+        keys
+    }
+
+    fn collect_xcconfig_defined_keys(
+        &self,
+        path: &Path,
+        seen: &mut HashSet<PathBuf>,
+        keys: &mut HashSet<String>,
+    ) {
+        if !seen.insert(path.to_path_buf()) {
+            return;
+        }
+        let Ok(contents) = fs::read_to_string(path) else {
+            return;
+        };
+        for line in contents.lines() {
+            let line = line
+                .split_once("//")
+                .map_or(line, |(prefix, _)| prefix)
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(include) = xcconfig_include_path(line) {
+                let parent_candidate = path
+                    .parent()
+                    .unwrap_or(&self.project.base_path)
+                    .join(&include);
+                let include_path = if parent_candidate.exists() {
+                    parent_candidate
+                } else {
+                    self.project.base_path.join(include)
+                };
+                self.collect_xcconfig_defined_keys(&include_path, seen, keys);
+                continue;
+            }
+            if let Some((key, _)) = line.split_once('=') {
+                let key = key
+                    .trim()
+                    .split_once('[')
+                    .map_or_else(|| key.trim(), |(base, _)| base.trim());
+                if !key.is_empty() {
+                    keys.insert(key.to_owned());
+                }
+            }
+        }
     }
 
     fn build_settings_for_config(
@@ -4819,17 +4929,18 @@ fn scheme_xml(
 ) -> String {
     let debug_config = default_config_for(project, "debug");
     let release_config = default_config_for(project, "release");
-    let runnable = first_runnable_scheme_target(project, &scheme.build.targets).or_else(|| {
-        scheme
-            .build
-            .targets
-            .first()
-            .map(|target| target.target.as_str())
-    });
+    let runnable = first_runnable_scheme_target(project, &scheme.build.targets);
+    let primary_build_target = scheme
+        .build
+        .targets
+        .first()
+        .map(|target| target.target.as_str());
+    let default_macro_expansion = runnable.is_none().then_some(()).and(primary_build_target);
     let run_macro_expansion = scheme
         .run
         .as_ref()
-        .and_then(|run| run.macro_expansion.as_deref());
+        .and_then(|run| run.macro_expansion.as_deref())
+        .or(default_macro_expansion);
     let testing_macro_expansion =
         first_testing_runnable_scheme_target(project, &scheme.build.targets);
     let test_macro_expansion = scheme
@@ -4837,22 +4948,24 @@ fn scheme_xml(
         .as_ref()
         .and_then(|test| test.macro_expansion.as_deref())
         .or(testing_macro_expansion)
-        .or(run_macro_expansion);
+        .or(run_macro_expansion)
+        .or(primary_build_target);
     let empty_command_line_arguments = indexmap::IndexMap::new();
+    let emit_empty_test_command_line_arguments = scheme.test.is_some();
     let mut output = String::new();
     output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    write_multiline_start(
-        &mut output,
-        0,
-        "Scheme",
-        &[
-            (
-                "LastUpgradeVersion",
-                xml_escape(&scheme_last_upgrade_version(project)),
-            ),
-            ("version", "1.7".to_owned()),
-        ],
-    );
+    let mut scheme_attrs = vec![(
+        "LastUpgradeVersion",
+        xml_escape(&scheme_last_upgrade_version(project)),
+    )];
+    if primary_build_target
+        .and_then(|target| project.targets.get(target))
+        .is_some_and(|target| scheme_target_is_app_extension(&target.target_type))
+    {
+        scheme_attrs.push(("wasCreatedForAppExtension", "YES".to_owned()));
+    }
+    scheme_attrs.push(("version", "1.7".to_owned()));
+    write_multiline_start(&mut output, 0, "Scheme", &scheme_attrs);
     write_build_action(&mut output, project, &scheme.build, object_id_map, 1);
     write_test_action(
         &mut output,
@@ -4918,7 +5031,7 @@ fn scheme_xml(
             .as_ref()
             .map(|test| &test.command_line_arguments)
             .unwrap_or(&empty_command_line_arguments),
-        false,
+        emit_empty_test_command_line_arguments,
         scheme
             .test
             .as_ref()
@@ -4995,7 +5108,7 @@ fn scheme_xml(
             .as_ref()
             .map(|run| &run.command_line_arguments)
             .unwrap_or(&empty_command_line_arguments),
-        false,
+        scheme.run.is_some(),
         scheme.run.as_ref().and_then(|run| run.language.as_deref()),
         scheme.run.as_ref().and_then(|run| run.region.as_deref()),
         scheme
@@ -5025,8 +5138,8 @@ fn scheme_xml(
             .as_ref()
             .map(|profile| profile.ask_for_app_to_launch)
             .unwrap_or(false),
-        false,
-        None,
+        scheme.profile.is_some(),
+        default_macro_expansion,
         &release_config,
         object_id_map,
         1,
@@ -5107,18 +5220,24 @@ fn target_scheme_xml(
     let empty_command_line_arguments = indexmap::IndexMap::new();
     let mut output = String::new();
     output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    write_multiline_start(
-        &mut output,
-        0,
-        "Scheme",
-        &[
-            (
-                "LastUpgradeVersion",
-                xml_escape(&scheme_last_upgrade_version(project)),
-            ),
-            ("version", "1.7".to_owned()),
-        ],
-    );
+    let mut scheme_attrs = vec![(
+        "LastUpgradeVersion",
+        xml_escape(&scheme_last_upgrade_version(project)),
+    )];
+    if matches!(
+        target.target_type,
+        ProductType::AppExtension
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
+            | ProductType::MessagesExtension
+            | ProductType::WatchExtension
+            | ProductType::Watch2Extension
+            | ProductType::TvExtension
+    ) {
+        scheme_attrs.push(("wasCreatedForAppExtension", "YES".to_owned()));
+    }
+    scheme_attrs.push(("version", "1.7".to_owned()));
+    write_multiline_start(&mut output, 0, "Scheme", &scheme_attrs);
     write_build_action(&mut output, project, &build, object_id_map, 1);
     write_test_action(
         &mut output,
@@ -5137,7 +5256,7 @@ fn target_scheme_xml(
         &scheme.test_plans,
         &scheme.environment_variables,
         &empty_command_line_arguments,
-        scheme.gather_coverage_data,
+        true,
         None,
         None,
         None,
@@ -5330,30 +5449,26 @@ fn write_test_action(
         ),
         (
             "shouldUseLaunchSchemeArgsEnv",
-            if !coverage_targets.is_empty()
-                || !pre_actions.is_empty()
-                || !command_line_arguments.is_empty()
-            {
-                "NO"
-            } else {
+            if command_line_arguments.is_empty() && environment_variables.is_empty() {
                 "YES"
+            } else {
+                "NO"
             }
             .to_owned(),
         ),
     ];
     if gather_coverage_data {
+        if disable_main_thread_checker {
+            attrs.push(("disableMainThreadChecker", "YES".to_owned()));
+        }
         attrs.push(("codeCoverageEnabled", "YES".to_owned()));
+    } else if disable_main_thread_checker {
+        attrs.push(("disableMainThreadChecker", "YES".to_owned()));
     }
     if !coverage_targets.is_empty() && gather_coverage_data {
         attrs.push(("onlyGenerateCoverageForSpecifiedTargets", "YES".to_owned()));
-    } else if gather_coverage_data || !pre_actions.is_empty() || !command_line_arguments.is_empty()
-    {
+    } else {
         attrs.push(("onlyGenerateCoverageForSpecifiedTargets", "NO".to_owned()));
-    } else if !gather_coverage_data {
-        attrs.push(("codeCoverageEnabled", "NO".to_owned()));
-    }
-    if disable_main_thread_checker {
-        attrs.push(("disableMainThreadChecker", "YES".to_owned()));
     }
     if stop_on_every_main_thread_checker_issue {
         attrs.push(("stopOnEveryMainThreadCheckerIssue", "YES".to_owned()));
@@ -5535,17 +5650,20 @@ fn write_launch_action(
             }
             .to_owned(),
         ),
-        ("launchStyle", "0".to_owned()),
-        (
-            "useCustomWorkingDirectory",
-            bool_xml(custom_working_directory.is_some()).to_owned(),
-        ),
     ];
-    if let Some(value) = custom_working_directory {
-        attrs.push(("customWorkingDirectory", xml_escape(value)));
+    if disable_main_thread_checker {
+        attrs.push(("disableMainThreadChecker", "YES".to_owned()));
     }
+    attrs.push(("launchStyle", "0".to_owned()));
     if ask_for_app_to_launch {
         attrs.push(("askForAppToLaunch", "YES".to_owned()));
+    }
+    attrs.push((
+        "useCustomWorkingDirectory",
+        bool_xml(custom_working_directory.is_some()).to_owned(),
+    ));
+    if let Some(value) = custom_working_directory {
+        attrs.push(("customWorkingDirectory", xml_escape(value)));
     }
     if let Some(value) = custom_lldb_init {
         attrs.push(("customLLDBInitFile", xml_escape(value)));
@@ -5567,9 +5685,6 @@ fn write_launch_action(
     ]);
     if let Some(value) = launch_automatically_substyle {
         attrs.push(("launchAutomaticallySubstyle", xml_escape(value)));
-    }
-    if disable_main_thread_checker {
-        attrs.push(("disableMainThreadChecker", "YES".to_owned()));
     }
     if stop_on_every_main_thread_checker_issue {
         attrs.push(("stopOnEveryMainThreadCheckerIssue", "YES".to_owned()));
@@ -6056,6 +6171,26 @@ fn product_type_is_runnable(product_type: &ProductType) -> bool {
             | ProductType::Watch2App
             | ProductType::MessagesApplication
             | ProductType::CommandLineTool
+            | ProductType::AppExtension
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
+            | ProductType::MessagesExtension
+            | ProductType::WatchExtension
+            | ProductType::Watch2Extension
+            | ProductType::TvExtension
+    )
+}
+
+fn scheme_target_is_app_extension(product_type: &ProductType) -> bool {
+    matches!(
+        product_type,
+        ProductType::AppExtension
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
+            | ProductType::MessagesExtension
+            | ProductType::WatchExtension
+            | ProductType::Watch2Extension
+            | ProductType::TvExtension
     )
 }
 
@@ -6534,6 +6669,19 @@ fn insert_project_setting_presets(settings: &mut BTreeMap<String, PbxValue>, con
             PbxValue::String("-O".to_owned()),
         );
     }
+}
+
+fn xcconfig_include_path(line: &str) -> Option<PathBuf> {
+    let include = line.strip_prefix("#include")?.trim();
+    let include = include
+        .strip_prefix('"')
+        .and_then(|value| value.split_once('"').map(|(path, _)| path))
+        .or_else(|| {
+            include
+                .strip_prefix('<')
+                .and_then(|value| value.split_once('>').map(|(path, _)| path))
+        })?;
+    Some(PathBuf::from(include))
 }
 
 fn insert_target_setting_presets(
@@ -7865,6 +8013,39 @@ fn copy_files_destination_key(settings: &CopyFilesSettings) -> (i64, String, Str
     )
 }
 
+fn copy_files_phase_output_key(
+    dst_subfolder_spec: i64,
+    dst_path: &str,
+    phase_name: &str,
+) -> (i64, i64, String, String) {
+    (
+        copy_files_phase_name_order(phase_name),
+        dst_subfolder_spec,
+        dst_path.to_owned(),
+        phase_name.to_owned(),
+    )
+}
+
+fn copy_files_phase_name_order(phase_name: &str) -> i64 {
+    match phase_name {
+        "Embed Foundation Extensions" => 0,
+        "Embed Frameworks" => 1,
+        _ => 2,
+    }
+}
+
+fn target_xcconfig_preserves_default(key: &str) -> bool {
+    matches!(
+        key,
+        "CURRENT_PROJECT_VERSION"
+            | "DYLIB_COMPATIBILITY_VERSION"
+            | "DYLIB_CURRENT_VERSION"
+            | "DYLIB_INSTALL_NAME_BASE"
+            | "INSTALL_PATH"
+            | "VERSIONING_SYSTEM"
+    )
+}
+
 fn default_source_copy_files_settings() -> CopyFilesSettings {
     CopyFilesSettings {
         dst_subfolder_spec: 10,
@@ -8032,12 +8213,21 @@ fn localized_variant_group_is_direct_child(source_root: &Path, path: &Path) -> b
 
 fn localized_variant_group_matches_source(
     source_root: &Path,
-    _source: &TargetSource,
+    source: &TargetSource,
     path: &Path,
 ) -> bool {
+    if is_localized_interface_file(path) {
+        return true;
+    }
+    if path.extension().and_then(|extension| extension.to_str()) == Some("strings") {
+        return source_root.is_dir()
+            && path.starts_with(source_root)
+            && !source
+                .excludes
+                .iter()
+                .any(|pattern| pattern.contains(".lproj/**"));
+    }
     localized_variant_group_is_direct_child(source_root, path)
-        || is_localized_interface_file(path)
-        || path.extension().and_then(|extension| extension.to_str()) == Some("strings")
 }
 
 fn is_localized_file(path: &Path) -> bool {
@@ -8892,7 +9082,6 @@ fn expand_source_path(
     let mut files = Vec::new();
     collect_files(&path, &mut files, file_types);
     files.retain(|file| source_matches_filters(&path, file, source));
-    files.sort();
     files
 }
 
@@ -9035,8 +9224,8 @@ fn source_excludes_directory(source_root: &Path, directory: &Path, source: &Targ
         .to_string_lossy()
         .into_owned();
     source.excludes.iter().any(|pattern| {
-        let pattern = pattern.trim_end_matches('/');
-        pattern == relative_to_source || pattern == relative_to_declared
+        source_pattern_matches(pattern, &relative_to_source)
+            || source_pattern_matches(pattern, &relative_to_declared)
     })
 }
 
@@ -9065,6 +9254,20 @@ fn source_pattern_matches(pattern: &str, path: &str) -> bool {
             || path.split('/').any(|part| wildcard_match(suffix, part));
     }
     if let Some(prefix) = pattern.strip_suffix("/**") {
+        if prefix.contains('*') {
+            return path
+                .split('/')
+                .scan(String::new(), |ancestor, part| {
+                    if ancestor.is_empty() {
+                        ancestor.push_str(part);
+                    } else {
+                        ancestor.push('/');
+                        ancestor.push_str(part);
+                    }
+                    Some(ancestor.clone())
+                })
+                .any(|ancestor| wildcard_match(prefix, &ancestor));
+        }
         return path == prefix || path.starts_with(&format!("{prefix}/"));
     }
     if path == pattern || path.starts_with(&format!("{pattern}/")) {
@@ -9516,9 +9719,12 @@ fn file_type_for_path(path: &str, product_type: Option<&ProductType>) -> String 
         Some("yml") | Some("yaml") => "text.yaml",
         Some("md") | Some("markdown") => "net.daringfireball.markdown",
         Some("json") => "text.json",
+        Some("html") => "text.html",
+        Some("sh") => "text.script.sh",
         Some("png") => "image.png",
         Some("gif") => "image.gif",
         Some("jpg") | Some("jpeg") => "image.jpeg",
+        Some("mp3") => "audio.mp3",
         Some("dae") => "text.xml.dae",
         Some("js") => "sourcecode.javascript",
         Some("metal") => "sourcecode.metal",
