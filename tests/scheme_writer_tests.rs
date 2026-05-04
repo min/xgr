@@ -153,8 +153,9 @@ fn writer_generates_shared_scheme_like_xcodegen() {
     assert!(xml_contains(&scheme, "codeCoverageEnabled=\"YES\""));
     assert!(xml_contains(
         &scheme,
-        "reference=\"container:App.xctestplan\" default=\"YES\""
+        "default=\"YES\" reference=\"container:App.xctestplan\""
     ));
+    assert!(scheme.find("<TestPlans>").unwrap() < scheme.find("<MacroExpansion>").unwrap());
     assert!(xml_contains(
         &scheme,
         "ProfileAction buildConfiguration=\"Release\""
@@ -246,6 +247,33 @@ fn writer_generates_target_scheme_config_variants_like_xcodegen() {
         &staging,
         "key=\"ENV\" value=\"VALUE\" isEnabled=\"YES\""
     ));
+}
+
+#[test]
+fn writer_generates_empty_launch_and_profile_arguments_for_target_schemes_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "TargetSchemeArgs",
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "scheme": {"testTargets": []}
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::write(&project, None).unwrap();
+    let scheme = fs::read_to_string(
+        generated
+            .project_path
+            .join("xcshareddata/xcschemes/App.xcscheme"),
+    )
+    .unwrap();
+    assert_eq!(xml_match_count(&scheme, "<CommandLineArguments>"), 3);
 }
 
 #[test]

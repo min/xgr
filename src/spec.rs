@@ -3284,7 +3284,7 @@ fn build_types_for_name(value: &str) -> Vec<BuildType> {
             BuildType::Analyzing,
             BuildType::Archiving,
         ],
-        "test" | "testing" => vec![BuildType::Testing, BuildType::Analyzing],
+        "test" | "testing" => vec![BuildType::Testing],
         "run" | "running" => vec![BuildType::Running],
         "profile" | "profiling" => vec![BuildType::Profiling],
         "analyze" | "analyzing" => vec![BuildType::Analyzing],
@@ -4713,7 +4713,7 @@ mod tests {
         assert_eq!(scheme.build.targets[0].build_types.len(), 5);
         assert_eq!(
             scheme.build.targets[1].build_types,
-            vec![BuildType::Testing, BuildType::Analyzing]
+            vec![BuildType::Testing]
         );
         assert!(scheme.build.targets[2].build_types.is_empty());
         assert_eq!(scheme.build.pre_actions[0].script, "echo Before Build");

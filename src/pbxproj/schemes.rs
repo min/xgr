@@ -539,7 +539,7 @@ fn target_scheme_xml(
         scheme.stop_on_every_main_thread_checker_issue,
         scheme.disable_thread_performance_checker,
         &scheme.command_line_arguments,
-        scheme.gather_coverage_data,
+        true,
         scheme.language.as_deref(),
         scheme.region.as_deref(),
         &scheme.environment_variables,
@@ -554,7 +554,7 @@ fn target_scheme_xml(
         Some(&release_config),
         &scheme.environment_variables,
         false,
-        scheme.gather_coverage_data,
+        true,
         macro_expansion,
         &release_config,
         object_id_map,
@@ -750,6 +750,9 @@ fn write_test_action(
             indent + 1,
         );
     }
+    if !test_plans.is_empty() {
+        write_test_plans(output, test_plans, indent + 1);
+    }
     write_macro_expansion(output, project, macro_expansion, object_id_map, indent + 1);
     write_indent(output, indent + 1);
     output.push_str("<Testables>\n");
@@ -804,21 +807,6 @@ fn write_test_action(
     }
     write_indent(output, indent + 1);
     output.push_str("</Testables>\n");
-    if !test_plans.is_empty() {
-        write_indent(output, indent + 1);
-        output.push_str("<TestPlans>\n");
-        for plan in test_plans {
-            write_indent(output, indent + 2);
-            let _ = writeln!(
-                output,
-                "<TestPlanReference reference=\"container:{}\" default=\"{}\"/>",
-                xml_escape(&plan.path),
-                bool_xml(plan.default_plan)
-            );
-        }
-        write_indent(output, indent + 1);
-        output.push_str("</TestPlans>\n");
-    }
     if !command_line_arguments.is_empty()
         || !environment_variables.is_empty()
         || emit_empty_command_line_arguments
@@ -855,6 +843,26 @@ fn write_test_action(
     }
     write_indent(output, indent);
     output.push_str("</TestAction>\n");
+}
+
+fn write_test_plans(output: &mut String, test_plans: &[crate::spec::TestPlan], indent: usize) {
+    write_indent(output, indent);
+    output.push_str("<TestPlans>\n");
+    for plan in test_plans {
+        write_multiline_start(
+            output,
+            indent + 1,
+            "TestPlanReference",
+            &[
+                ("default", bool_xml(plan.default_plan).to_owned()),
+                ("reference", format!("container:{}", xml_escape(&plan.path))),
+            ],
+        );
+        write_indent(output, indent + 1);
+        output.push_str("</TestPlanReference>\n");
+    }
+    write_indent(output, indent);
+    output.push_str("</TestPlans>\n");
 }
 
 #[allow(clippy::too_many_arguments)]
