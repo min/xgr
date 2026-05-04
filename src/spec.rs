@@ -1230,6 +1230,7 @@ pub struct Target {
     pub platform: Platform,
     pub supported_destinations: Vec<String>,
     pub deployment_target: Option<String>,
+    pub deployment_targets: DeploymentTarget,
     pub settings: Value,
     pub settings_spec: Settings,
     pub config_files: IndexMap<String, String>,
@@ -1294,15 +1295,19 @@ impl Target {
             });
         let platform = Platform::parse(platform_string)?;
 
+        let deployment_target = scalar_to_string(map.get("deploymentTarget"))
+            .map(format_deployment_target)
+            .transpose()?;
+        let deployment_targets = DeploymentTarget::from_value(map.get("deploymentTarget"));
+
         Ok(Self {
             name: resolved_name,
             product_name,
             target_type,
             platform: platform.clone(),
             supported_destinations,
-            deployment_target: scalar_to_string(map.get("deploymentTarget"))
-                .map(format_deployment_target)
-                .transpose()?,
+            deployment_target,
+            deployment_targets,
             settings: map.get("settings").cloned().unwrap_or(Value::Null),
             settings_spec: Settings::from_value(map.get("settings")),
             config_files: parse_string_map(map.get("configFiles")).unwrap_or_default(),
