@@ -22,6 +22,7 @@ Implemented:
 - Typed models for projects, targets, dependencies, sources, settings, schemes, plists, and breakpoints.
 - Deterministic PBX project generation.
 - Scheme, breakpoint, generated plist, and entitlement file writing.
+- XcodeGen `postGenCommand` execution when writing a project.
 - Upstream XcodeGen fixture coverage and test-inventory tracking.
 - GitHub Actions CI for formatting, clippy, tests, and dependency audit.
 
@@ -33,7 +34,10 @@ The compatibility target is upstream XcodeGen behavior for `project.yml` specs. 
 
 Known limitations:
 
-- XcodeGen `preGenCommand` and `postGenCommand` hooks are not executed.
+- XcodeGen `preGenCommand` hooks are not executed.
+- `postGenCommand` is executed by project-writing paths (`xgr generate` and
+  `ProjectWriter::write`), but not by in-memory generation
+  (`ProjectWriter::generate`).
 - Compatibility is measured against the vendored `upstream-xcodegen` checkout. Updating that checkout requires rerunning the inventory workflow documented in `TEST_PARITY.md`.
 - The project is not yet released as a supported replacement for every real-world XcodeGen configuration. If output differs from upstream XcodeGen, please file a compatibility issue with the spec and a description of the expected output.
 
@@ -73,33 +77,34 @@ Published crates.io packages and binary release artifacts are not available yet.
 Validate a spec:
 
 ```sh
-cargo run --bin xgr -- validate --spec upstream-xcodegen/Tests/Fixtures/TestProject/project.yml
+xgr validate --spec upstream-xcodegen/Tests/Fixtures/TestProject/project.yml
 ```
 
 Print the resolved JSON form:
 
 ```sh
-cargo run --bin xgr -- dump --spec upstream-xcodegen/Tests/Fixtures/TestProject/project.yml
+xgr dump --spec upstream-xcodegen/Tests/Fixtures/TestProject/project.yml
 ```
 
 Generate an Xcode project:
 
 ```sh
-cargo run --bin xgr -- generate --spec upstream-xcodegen/Tests/Fixtures/SPM/project.yml
+xgr generate --spec upstream-xcodegen/Tests/Fixtures/SPM/project.yml
 ```
 
 Generate to an explicit path:
 
 ```sh
-cargo run --bin xgr -- generate \
+xgr generate \
   --spec path/to/project.yml \
   --output path/to/Project.xcodeproj
 ```
 
-After installing with `cargo install`, replace `cargo run --bin xgr --` with `xgr`:
+From an uninstalled checkout, build first and run the local binary directly:
 
 ```sh
-xgr generate --spec path/to/project.yml --output path/to/Project.xcodeproj
+cargo build --release --locked
+target/release/xgr generate --spec path/to/project.yml --output path/to/Project.xcodeproj
 ```
 
 When evaluating a real project, generate into a temporary path first and compare the generated project against upstream XcodeGen before replacing checked-in files.
@@ -122,7 +127,7 @@ Local benchmark artifacts should stay under `.context/bench`, which is ignored b
 For public real-world XcodeGen comparisons, use:
 
 ```sh
-scripts/bench_public_xcodegen.sh --only mapbox-maps-ios
+scripts/bench_public_xcodegen.sh --only element-ios
 ```
 
 The script keeps cloned repositories, generated projects, diffs, and timing JSON under
@@ -138,6 +143,8 @@ See `CHANGELOG.md` for release history and unreleased public-prep changes.
 
 Treat project specs as trusted project configuration, not sandboxed input. `xgr` reads files referenced by specs and writes generated project artifacts to requested output paths.
 
-`xgr` does not currently execute XcodeGen `preGenCommand` or `postGenCommand` hooks. Generated Xcode projects may still contain build scripts that Xcode can execute later.
+`xgr` does not currently execute XcodeGen `preGenCommand` hooks. `postGenCommand`
+is executed when writing a project, and generated Xcode projects may still
+contain build scripts that Xcode can execute later.
 
 See `SECURITY.md` for vulnerability reporting guidance.
