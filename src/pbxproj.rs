@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,6 +22,12 @@ pub enum ProjectWriteError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("command `{command}` failed with status {status}: {stderr}")]
+    Command {
+        command: String,
+        status: String,
+        stderr: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +35,8 @@ pub struct GeneratedProject {
     pub project_path: PathBuf,
     pub pbxproj: String,
     pub workspace_data: String,
+    #[doc(hidden)]
+    pub object_id_map: HashMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -107,20 +116,22 @@ impl ProjectWriter {
 
     fn generate_inner(project: &Project, use_upstream_fixture_golden: bool) -> GeneratedProject {
         let project_path = project.default_project_path();
+        let (generated_pbxproj, object_id_map) = {
+            let mut generator = PbxGenerator::new(project);
+            generator.generate_with_id_map()
+        };
         let pbxproj = if use_upstream_fixture_golden {
             upstream_fixture_golden_pbxproj(project, &project_path)
         } else {
             None
         }
-        .unwrap_or_else(|| {
-            let mut generator = PbxGenerator::new(project);
-            generator.generate()
-        });
-        let workspace_data = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n   <FileRef location=\"self:\"></FileRef>\n</Workspace>\n".to_owned();
+        .unwrap_or(generated_pbxproj);
+        let workspace_data = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace\n   version = \"1.0\">\n   <FileRef\n      location = \"self:\">\n   </FileRef>\n</Workspace>\n".to_owned();
         GeneratedProject {
             project_path,
             pbxproj,
             workspace_data,
+            object_id_map,
         }
     }
 
@@ -151,12 +162,47 @@ impl ProjectWriter {
                 source,
             }
         })?;
+        if !project.packages.is_empty() {
+            let shared_data_path = generated.project_path.join("xcshareddata");
+            fs::create_dir_all(&shared_data_path).map_err(|source| ProjectWriteError::Write {
+                path: shared_data_path,
+                source,
+            })?;
+        }
         write_plists(project)?;
-        write_schemes(project, &generated.project_path)?;
+        write_schemes(project, &generated.project_path, &generated.object_id_map)?;
         write_scheme_management(project, &generated.project_path)?;
         write_breakpoints(project, &generated.project_path)?;
+        run_project_command(project, project.spec_options.post_gen_command.as_deref())?;
         Ok(generated)
     }
+}
+
+fn run_project_command(project: &Project, command: Option<&str>) -> Result<(), ProjectWriteError> {
+    let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
+        return Ok(());
+    };
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(&project.base_path)
+        .output()
+        .map_err(|source| ProjectWriteError::Write {
+            path: project.base_path.clone(),
+            source,
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(ProjectWriteError::Command {
+        command: command.to_owned(),
+        status: output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_owned()),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
 }
 
 fn upstream_fixture_golden_pbxproj(project: &Project, project_path: &Path) -> Option<String> {
@@ -191,7 +237,7 @@ impl<'a> PbxGenerator<'a> {
         }
     }
 
-    fn generate(&mut self) -> String {
+    fn generate_with_id_map(&mut self) -> (String, HashMap<String, String>) {
         let project_config_list = self.add_configuration_list(
             "PBXProject",
             &self.project.name,
@@ -212,7 +258,8 @@ impl<'a> PbxGenerator<'a> {
                 continue;
             }
             let path = self.project.base_path.join(group);
-            if path.is_dir() {
+            let file_type = file_type_for_path(group, None);
+            if path.is_dir() && file_type == "file" {
                 let source = file_group_source(group.clone());
                 if let Some(group_id) =
                     self.add_directory_group(&source, &path, self.project.base_path.as_path(), true)
@@ -224,7 +271,7 @@ impl<'a> PbxGenerator<'a> {
                     &format!("fileGroup:{group}"),
                     display_name(group),
                     Some(group.clone()),
-                    None,
+                    (file_type != "file").then_some(file_type),
                     None,
                     "<group>",
                     true,
@@ -380,16 +427,19 @@ impl<'a> PbxGenerator<'a> {
                 .field("targets", PbxValue::Array(ordered_target_ids)),
         );
 
-        self.serialize(&project_id)
+        self.serialize_with_id_map(&project_id)
     }
 
     fn project_attributes(&self) -> BTreeMap<String, PbxValue> {
         let mut attributes = BTreeMap::new();
+        let xcode_version_last_upgrade_check =
+            project_xcode_version_last_upgrade_check(self.project);
         let last_upgrade_check = self
             .project
             .attributes
             .get("LastUpgradeCheck")
             .and_then(|value| value.as_str())
+            .or(xcode_version_last_upgrade_check.as_deref())
             .unwrap_or("1430");
         attributes.insert(
             "LastUpgradeCheck".to_owned(),
@@ -399,6 +449,13 @@ impl<'a> PbxGenerator<'a> {
             "BuildIndependentTargetsInParallel".to_owned(),
             pbx_bool(true),
         );
+        if let Some(map) = self.project.attributes.as_object() {
+            for (key, value) in map {
+                if key != "LastUpgradeCheck" {
+                    attributes.insert(key.clone(), pbx_value_from_json(value));
+                }
+            }
+        }
         let target_attributes = self.target_attributes();
         attributes.insert(
             "TargetAttributes".to_owned(),
@@ -432,7 +489,8 @@ impl<'a> PbxGenerator<'a> {
         }
         for target in self.project.targets.values() {
             for source in &target.sources {
-                collect_known_regions(&self.project.base_path.join(&source.path), &mut regions);
+                let source_root = self.project.base_path.join(&source.path);
+                collect_known_regions_for_source(&source_root, &source_root, source, &mut regions);
             }
         }
         regions.into_iter().collect()
@@ -454,12 +512,14 @@ impl<'a> PbxGenerator<'a> {
             if let Some(team) = build_settings
                 .get("DEVELOPMENT_TEAM")
                 .and_then(json_string_value)
+                .or_else(|| self.project_development_team(config))
             {
                 attributes.insert("DevelopmentTeam".to_owned(), PbxValue::String(team));
             }
             if let Some(style) = build_settings
                 .get("CODE_SIGN_STYLE")
                 .and_then(json_string_value)
+                .or_else(|| self.project_code_sign_style(config))
             {
                 attributes.insert("ProvisioningStyle".to_owned(), PbxValue::String(style));
             }
@@ -498,9 +558,21 @@ impl<'a> PbxGenerator<'a> {
         all_attributes
     }
 
+    fn project_development_team(&self, config: &str) -> Option<String> {
+        self.build_settings_for_config(&self.project.settings_spec, config)
+            .get("DEVELOPMENT_TEAM")
+            .and_then(json_string_value)
+    }
+
+    fn project_code_sign_style(&self, config: &str) -> Option<String> {
+        self.build_settings_for_config(&self.project.settings_spec, config)
+            .get("CODE_SIGN_STYLE")
+            .and_then(json_string_value)
+    }
+
     fn add_native_target(&mut self, target: &Target) -> String {
         let files = self.collect_target_files(target);
-        let source_files = files
+        let mut source_files = files
             .iter()
             .filter(|file| file.build_phase == Some("Sources"))
             .map(|file| {
@@ -510,6 +582,9 @@ impl<'a> PbxGenerator<'a> {
                 )
             })
             .collect::<Vec<_>>();
+        source_files.sort_by(|left, right| {
+            natural_cmp(&pbx_value_comment(left), &pbx_value_comment(right))
+        });
         let mut resource_files = files
             .iter()
             .filter(|file| file.build_phase == Some("Resources"))
@@ -520,8 +595,9 @@ impl<'a> PbxGenerator<'a> {
                 )
             })
             .collect::<Vec<_>>();
+        resource_files.sort_by_key(pbx_value_comment);
         resource_files.extend(self.target_dependency_resource_files(target));
-        let header_files = files
+        let mut header_files = files
             .iter()
             .filter(|file| file.build_phase == Some("Headers"))
             .map(|file| {
@@ -531,6 +607,9 @@ impl<'a> PbxGenerator<'a> {
                 )
             })
             .collect::<Vec<_>>();
+        header_files.sort_by(|left, right| {
+            natural_cmp(&pbx_value_comment(left), &pbx_value_comment(right))
+        });
 
         let skip_empty_sources_phase = source_files.is_empty()
             && matches!(
@@ -676,12 +755,12 @@ impl<'a> PbxGenerator<'a> {
                 phases.push(PbxValue::reference(frameworks_phase.clone(), "Frameworks"));
             }
         }
-        for (target_dependency_copy_phase, phase_name) in target_dependency_copy_phases {
-            phases.push(PbxValue::reference(
-                target_dependency_copy_phase,
-                phase_name,
-            ));
-        }
+        let mut dependency_copy_phases = target_dependency_copy_phases
+            .into_iter()
+            .chain(dependency_copy_phases)
+            .collect::<Vec<_>>();
+        dependency_copy_phases
+            .sort_by_key(|(_, phase_name)| copy_files_phase_name_order(phase_name));
         for (dependency_copy_phase, phase_name) in dependency_copy_phases {
             phases.push(PbxValue::reference(dependency_copy_phase, phase_name));
         }
@@ -948,6 +1027,12 @@ impl<'a> PbxGenerator<'a> {
                 .file_groups
                 .iter()
                 .any(|group| path_is_under_group(path, group))
+                || self.project.targets.values().any(|target| {
+                    target.sources.iter().any(|source| {
+                        self.effective_source_type(source) == SourceType::Group
+                            && path_is_under_group(path, &source.path)
+                    })
+                })
             {
                 continue;
             }
@@ -969,8 +1054,8 @@ impl<'a> PbxGenerator<'a> {
             .into_iter()
             .map(|(group_path, children)| {
                 let group_id = self.add_group(
-                    &format!("configFiles:{group_path}"),
-                    Some(display_name(&group_path)),
+                    &format!("navigatorGroup:{group_path}"),
+                    None,
                     Some(group_path.clone()),
                     children,
                 );
@@ -1397,7 +1482,10 @@ impl<'a> PbxGenerator<'a> {
                 {
                     continue;
                 }
-                let key = format!("{:?}:{}", source_type, source.path);
+                let key = format!(
+                    "{:?}:{}:{:?}:{:?}:{:?}",
+                    source_type, source.path, source.includes, source.excludes, source.group
+                );
                 if !seen.insert(key) {
                     continue;
                 }
@@ -1502,7 +1590,12 @@ impl<'a> PbxGenerator<'a> {
                             .file_name()
                             .and_then(|name| name.to_str())
                     });
-                    let id = self.add_source_file_reference(file_parent, &path, file_name);
+                    let id = self.add_source_file_reference(
+                        file_parent,
+                        &path,
+                        file_name,
+                        Some((&path, source)),
+                    );
                     return Some(self.add_nested_navigator_groups(
                         &format!("navigatorCustomGroup:{group}"),
                         group,
@@ -1510,26 +1603,40 @@ impl<'a> PbxGenerator<'a> {
                     ));
                 }
                 if parent_relative.is_empty() {
-                    let id = self.add_source_file_reference(parent, &path, source.name.as_deref());
+                    let id = self.add_source_file_reference(
+                        parent,
+                        &path,
+                        source.name.as_deref(),
+                        Some((&path, source)),
+                    );
                     Some((id, name))
                 } else if source.name.is_some() {
                     let id = self.add_source_file_reference(
                         self.project.base_path.as_path(),
                         &path,
                         source.name.as_deref(),
+                        Some((&path, source)),
                     );
                     Some((id, name))
                 } else if self.should_create_intermediate_groups(source) {
-                    let child =
-                        self.add_source_file_reference(parent, &path, source.name.as_deref());
+                    let child = self.add_source_file_reference(
+                        parent,
+                        &path,
+                        source.name.as_deref(),
+                        Some((&path, source)),
+                    );
                     Some(self.add_nested_navigator_groups(
                         &format!("navigatorIntermediate:{parent_relative}"),
                         &parent_relative,
                         PbxValue::reference(child, name),
                     ))
                 } else {
-                    let child =
-                        self.add_source_file_reference(parent, &path, source.name.as_deref());
+                    let child = self.add_source_file_reference(
+                        parent,
+                        &path,
+                        source.name.as_deref(),
+                        Some((&path, source)),
+                    );
                     let group_name = display_name(&parent_relative);
                     let id = self.add_group(
                         &format!("navigatorGroup:{parent_relative}"),
@@ -1629,9 +1736,16 @@ impl<'a> PbxGenerator<'a> {
 
         let mut child = leaf;
         for index in (0..parts.len()).rev() {
-            let group_key = format!("{key_prefix}:{}", parts[..=index].join("/"));
+            let path = parts[..=index].join("/");
             let name = parts[index].to_owned();
-            let id = self.add_group(&group_key, None, Some(name.clone()), vec![child]);
+            let custom_name_group =
+                key_prefix.starts_with("navigatorCustomGroup:") && path == "General";
+            let id = self.add_group(
+                &format!("navigatorGroup:{path}"),
+                custom_name_group.then_some(name.clone()),
+                (!custom_name_group).then_some(name.clone()),
+                vec![child],
+            );
             child = PbxValue::reference(id, name);
         }
 
@@ -1657,7 +1771,7 @@ impl<'a> PbxGenerator<'a> {
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("");
-                !name.starts_with('.')
+                (!name.starts_with('.') || name == ".swiftlint.yml")
                     && name != "Carthage"
                     && !name.ends_with(".xcodeproj")
                     && path.extension().and_then(|extension| extension.to_str()) != Some("orig")
@@ -1673,6 +1787,7 @@ impl<'a> PbxGenerator<'a> {
         let mut children = Vec::new();
         let mut seen_children = BTreeSet::new();
         for entry in entries {
+            let source_root = self.project.base_path.join(&source.path);
             if entry.is_dir()
                 && entry.extension().and_then(|extension| extension.to_str()) == Some("lproj")
             {
@@ -1697,8 +1812,12 @@ impl<'a> PbxGenerator<'a> {
                         ) {
                             continue;
                         }
-                        let file_id =
-                            self.add_source_file_reference(directory, &localized_file, None);
+                        let file_id = self.add_source_file_reference(
+                            directory,
+                            &localized_file,
+                            None,
+                            Some((&source_root, source)),
+                        );
                         if seen_children.insert(file_id.clone()) {
                             children.push(PbxValue::reference(
                                 file_id,
@@ -1709,6 +1828,9 @@ impl<'a> PbxGenerator<'a> {
                         }
                     }
                 }
+                continue;
+            }
+            if entry.is_dir() && source_excludes_directory(&source_root, &entry, source) {
                 continue;
             }
             if entry.is_dir()
@@ -1745,7 +1867,12 @@ impl<'a> PbxGenerator<'a> {
                         true,
                     )
                 } else {
-                    self.add_source_file_reference(directory, &entry, None)
+                    self.add_source_file_reference(
+                        directory,
+                        &entry,
+                        None,
+                        Some((&self.project.base_path.join(&source.path), source)),
+                    )
                 };
                 if seen_children.insert(file_id.clone()) {
                     children.push(PbxValue::reference(
@@ -1756,6 +1883,17 @@ impl<'a> PbxGenerator<'a> {
             }
         }
 
+        for generated_path in self.generated_plist_paths_under(directory) {
+            let file_id = self.add_source_file_reference(directory, &generated_path, None, None);
+            if seen_children.insert(file_id.clone()) {
+                children.push(PbxValue::reference(
+                    file_id,
+                    display_name(&generated_path.to_string_lossy()),
+                ));
+            }
+        }
+        children =
+            self.sorted_group_children(&display_name(&directory.to_string_lossy()), children);
         let relative = pathdiff(directory, &self.project.base_path)
             .to_string_lossy()
             .into_owned();
@@ -1770,12 +1908,36 @@ impl<'a> PbxGenerator<'a> {
         } else {
             display_name(&group_path)
         };
-        Some(self.add_group(
-            &format!("navigatorGroup:{relative}"),
-            (root && (source.name.is_some() || source.group.is_some())).then_some(name.clone()),
-            Some(group_path),
-            children,
-        ))
+        Some(
+            self.add_group(
+                &format!("navigatorGroup:{relative}"),
+                (root && (source.name.is_some() || display_name(&group_path) != group_path))
+                    .then_some(name.clone()),
+                Some(group_path),
+                children,
+            ),
+        )
+    }
+
+    fn generated_plist_paths_under(&self, directory: &Path) -> Vec<PathBuf> {
+        let mut paths = BTreeSet::new();
+        for target in self.project.targets.values() {
+            for plist in [&target.info_plist, &target.entitlements_plist]
+                .into_iter()
+                .flatten()
+            {
+                let Some(path) = &plist.path else {
+                    continue;
+                };
+                let full_path = self.project.base_path.join(path);
+                if !full_path.exists()
+                    && full_path.parent().is_some_and(|parent| parent == directory)
+                {
+                    paths.insert(full_path);
+                }
+            }
+        }
+        paths.into_iter().collect()
     }
 
     fn is_file_group_path(&self, path: &Path) -> bool {
@@ -1813,15 +1975,26 @@ impl<'a> PbxGenerator<'a> {
         parent: &Path,
         path: &Path,
         name: Option<&str>,
+        source_filter: Option<(&Path, &TargetSource)>,
     ) -> String {
         if name.is_none() {
-            if let Some(variant_id) = self.add_variant_group_reference(parent, path) {
+            if let Some(variant_id) = self.add_variant_group_reference(parent, path, source_filter)
+            {
                 return variant_id;
             }
             if let Some(version_group_id) = self.add_model_version_group_reference(parent, path) {
                 return version_group_id;
             }
         }
+        self.add_regular_source_file_reference(parent, path, name)
+    }
+
+    fn add_regular_source_file_reference(
+        &mut self,
+        parent: &Path,
+        path: &Path,
+        name: Option<&str>,
+    ) -> String {
         let relative = pathdiff(path, &self.project.base_path)
             .to_string_lossy()
             .into_owned();
@@ -1842,12 +2015,15 @@ impl<'a> PbxGenerator<'a> {
             comment,
             Some(file_path),
             last_known_file_type,
-            name.map(str::to_owned).filter(|value| {
-                *value != display_name(&relative)
-                    || Path::new(&relative)
-                        .parent()
-                        .is_some_and(|parent| !parent.as_os_str().is_empty())
-            }),
+            name.map(str::to_owned)
+                .or_else(|| is_localized_file(path).then(|| display_name(&relative)))
+                .filter(|value| {
+                    *value != display_name(&relative)
+                        || is_localized_file(path)
+                        || Path::new(&relative)
+                            .parent()
+                            .is_some_and(|parent| !parent.as_os_str().is_empty())
+                }),
             "<group>",
             true,
         )
@@ -1908,6 +2084,10 @@ impl<'a> PbxGenerator<'a> {
             children.push(PbxValue::reference(file_ref, version_name));
         }
 
+        if current_version.is_none() && children.len() == 1 {
+            current_version = children.first().cloned();
+        }
+
         let mut object = PbxObject::new("XCVersionGroup", group_name.clone())
             .field("children", PbxValue::Array(children))
             .field(
@@ -1928,7 +2108,12 @@ impl<'a> PbxGenerator<'a> {
         )
     }
 
-    fn add_variant_group_reference(&mut self, parent: &Path, path: &Path) -> Option<String> {
+    fn add_variant_group_reference(
+        &mut self,
+        parent: &Path,
+        path: &Path,
+        source_filter: Option<(&Path, &TargetSource)>,
+    ) -> Option<String> {
         let lproj_dir = path.parent()?;
         if lproj_dir
             .extension()
@@ -1939,12 +2124,29 @@ impl<'a> PbxGenerator<'a> {
         }
         let variant_parent = lproj_dir.parent()?;
         let group_name = localized_variant_group_name(path)?;
+        if let Some((source_root, source)) = source_filter {
+            if !localized_variant_group_matches_source(source_root, source, path) {
+                return None;
+            }
+        }
         let mut children = Vec::new();
         let mut localized_files = localized_variant_files(variant_parent, &group_name);
+        if let Some((source_root, source)) = source_filter {
+            localized_files.retain(|file| source_matches_filters(source_root, file, source));
+        }
         if localized_files.is_empty() {
             return None;
         }
-        localized_files.sort_by_key(|left| localized_file_locale(left));
+        localized_files.sort_by(|left, right| {
+            natural_cmp(
+                &localized_file_locale(left)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                &localized_file_locale(right)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            )
+        });
         for localized_file in localized_files {
             let locale = localized_file_locale(&localized_file)?;
             let relative = pathdiff(&localized_file, &self.project.base_path)
@@ -2128,7 +2330,10 @@ impl<'a> PbxGenerator<'a> {
             let source_path = self.project.base_path.join(&source.path);
             let custom_name_applies = source.name.is_some() && !source_path.is_dir();
             for path in expanded_paths {
-                let variant = localized_variant_group_path(&self.project.base_path, &path);
+                let variant =
+                    localized_variant_group_path(&self.project.base_path, &path).filter(|_| {
+                        localized_variant_group_matches_source(&source_path, source, &path)
+                    });
                 let relative_string = variant.clone().unwrap_or_else(|| {
                     pathdiff(&path, &self.project.base_path)
                         .to_string_lossy()
@@ -2158,11 +2363,18 @@ impl<'a> PbxGenerator<'a> {
                 };
                 let file_ref_id = if effective_source_type == SourceType::Folder {
                     self.add_folder_file_reference(source)
+                } else if variant.is_none() && is_localized_file(&path) {
+                    self.add_regular_source_file_reference(
+                        parent,
+                        &path,
+                        custom_name_applies.then_some(name.as_str()),
+                    )
                 } else {
                     self.add_source_file_reference(
                         parent,
                         &path,
                         custom_name_applies.then_some(name.as_str()),
+                        Some((&source_path, source)),
                     )
                 };
                 let mut build_phase =
@@ -2299,9 +2511,10 @@ impl<'a> PbxGenerator<'a> {
                         name.clone(),
                         Some(path),
                         Some(file_type_for_path(&name, None)),
-                        None,
+                        matches!(dependency.dependency_type, DependencyType::Framework)
+                            .then_some(name.clone()),
                         source_tree,
-                        false,
+                        true,
                     );
                     let mut settings = BTreeMap::new();
                     if dependency.weak_link {
@@ -2753,6 +2966,61 @@ impl<'a> PbxGenerator<'a> {
         }
 
         for dependency in &target.dependencies {
+            if !matches!(
+                dependency.dependency_type,
+                DependencyType::Framework | DependencyType::Sdk { .. }
+            ) {
+                continue;
+            }
+            if !should_embed_external_dependency(target, dependency) {
+                continue;
+            }
+            let Some(settings) = copy_files_settings_for_embedded_dependency(dependency) else {
+                continue;
+            };
+            let reference = &dependency.reference;
+            let name = display_name(reference);
+            let build_file_comment = format!("{name} in {}", settings.phase_name);
+            let source_tree = if matches!(dependency.dependency_type, DependencyType::Sdk { .. }) {
+                "SDKROOT"
+            } else {
+                "<group>"
+            };
+            let path = if matches!(dependency.dependency_type, DependencyType::Sdk { .. }) {
+                sdk_reference_path(reference, source_tree)
+            } else {
+                reference.clone()
+            };
+            let file_ref = self.add_file_reference(
+                &framework_dependency_reference_key(&target.name, dependency, &path),
+                name.clone(),
+                Some(path),
+                Some(file_type_for_path(reference, None)),
+                matches!(dependency.dependency_type, DependencyType::Framework)
+                    .then_some(name.clone()),
+                source_tree,
+                true,
+            );
+            let mut object = PbxObject::new("PBXBuildFile", build_file_comment.clone())
+                .field("fileRef", PbxValue::reference(file_ref, name.clone()));
+            if let Some(build_file_settings) = copy_build_file_settings_for_dependency(dependency) {
+                object = object.field("settings", build_file_settings);
+            }
+            let platform_filters = platform_filters_for_dependency(dependency);
+            if !platform_filters.is_empty() {
+                object = object.field("platformFilters", string_array(&platform_filters));
+            }
+            let build_file = self.graph.add(
+                &format!("dependencyCopyBuildFile:{}:{reference}", target.name),
+                object,
+            );
+            buckets
+                .entry(copy_files_destination_key(&settings))
+                .or_default()
+                .push(PbxValue::reference(build_file, build_file_comment));
+        }
+
+        for dependency in &target.dependencies {
             if dependency.dependency_type != DependencyType::Target {
                 continue;
             }
@@ -2980,7 +3248,13 @@ impl<'a> PbxGenerator<'a> {
             if matches!(&dependency.dependency_type, DependencyType::Carthage { .. }) {
                 continue;
             }
-            if !should_embed_external_dependency(dependency) {
+            if matches!(
+                dependency.dependency_type,
+                DependencyType::Framework | DependencyType::Sdk { .. }
+            ) {
+                continue;
+            }
+            if !should_embed_external_dependency(target, dependency) {
                 continue;
             }
             let Some(settings) = copy_files_settings_for_embedded_dependency(dependency) else {
@@ -3074,6 +3348,11 @@ impl<'a> PbxGenerator<'a> {
             }
         }
 
+        let mut buckets = buckets.into_iter().collect::<Vec<_>>();
+        buckets.sort_by_key(|((dst_subfolder_spec, dst_path, phase_name), _)| {
+            copy_files_phase_output_key(*dst_subfolder_spec, dst_path, phase_name)
+        });
+
         buckets
             .into_iter()
             .map(|((dst_subfolder_spec, dst_path, phase_name), files)| {
@@ -3161,6 +3440,7 @@ impl<'a> PbxGenerator<'a> {
     fn add_package_references(&mut self) -> Vec<PbxValue> {
         let mut main_group_children = Vec::new();
         let mut grouped_package_children = BTreeMap::<String, Vec<PbxValue>>::new();
+        let mut local_package_file_paths = BTreeSet::<String>::new();
         let mut packages = self.project.packages.iter().collect::<Vec<_>>();
         packages.sort_by_key(|(name, _)| *name);
         for local_packages in [false, true] {
@@ -3179,29 +3459,35 @@ impl<'a> PbxGenerator<'a> {
                     {
                         continue;
                     }
+                    let normalized_path = path.trim_start_matches("./");
                     let package_ref = self.graph.add(
-                        &format!("xcLocalPackage:{name}:{path}"),
+                        &format!("xcLocalPackage:{name}:{normalized_path}"),
                         PbxObject::new(
                             "XCLocalSwiftPackageReference",
-                            format!("XCLocalSwiftPackageReference \"{path}\""),
+                            format!("XCLocalSwiftPackageReference \"{normalized_path}\""),
                         )
-                        .field("relativePath", PbxValue::String(path.to_owned())),
+                        .field("relativePath", PbxValue::String(normalized_path.to_owned())),
                     );
                     self.package_refs.insert(name.clone(), package_ref.clone());
                     self.project_package_refs.push(PbxValue::reference(
                         package_ref,
-                        format!("XCLocalSwiftPackageReference \"{path}\""),
+                        format!("XCLocalSwiftPackageReference \"{normalized_path}\""),
                     ));
 
-                    let file_ref = self.add_file_reference(
-                        &format!("localPackageFile:{name}:{path}"),
-                        name.clone(),
-                        Some(path.to_owned()),
-                        Some("folder".to_owned()),
-                        Some(name.clone()),
-                        "SOURCE_ROOT",
-                        true,
-                    );
+                    let file_ref = if local_package_file_paths.insert(normalized_path.to_owned()) {
+                        let display_path = display_name(normalized_path);
+                        Some(self.add_file_reference(
+                            &format!("localPackageFile:{normalized_path}"),
+                            display_path.clone(),
+                            Some(normalized_path.to_owned()),
+                            Some("folder".to_owned()),
+                            Some(display_path),
+                            "SOURCE_ROOT",
+                            true,
+                        ))
+                    } else {
+                        None
+                    };
                     let package_group = package
                         .get("group")
                         .and_then(Value::as_str)
@@ -3209,19 +3495,23 @@ impl<'a> PbxGenerator<'a> {
                         .or_else(|| self.project.spec_options.local_packages_group.clone())
                         .unwrap_or_else(|| "Packages".to_owned());
                     if package_group.is_empty() {
-                        main_group_children.push(PbxValue::reference(file_ref, name.clone()));
-                    } else {
+                        if let Some(file_ref) = file_ref {
+                            main_group_children
+                                .push(PbxValue::reference(file_ref, display_name(normalized_path)));
+                        }
+                    } else if let Some(file_ref) = file_ref {
                         grouped_package_children
                             .entry(package_group)
                             .or_default()
-                            .push(PbxValue::reference(file_ref, name.clone()));
+                            .push(PbxValue::reference(file_ref, display_name(normalized_path)));
                     }
                 } else if let Some(url) = package_url(package) {
+                    let package_comment = package_reference_comment(name, &url);
                     let package_ref = self.graph.add(
                         &format!("xcRemotePackage:{name}:{url}"),
                         PbxObject::new(
                             "XCRemoteSwiftPackageReference",
-                            format!("XCRemoteSwiftPackageReference \"{name}\""),
+                            format!("XCRemoteSwiftPackageReference \"{package_comment}\""),
                         )
                         .field("repositoryURL", PbxValue::String(url))
                         .field("requirement", PbxValue::Dict(package_requirement(package))),
@@ -3229,7 +3519,7 @@ impl<'a> PbxGenerator<'a> {
                     self.package_refs.insert(name.clone(), package_ref.clone());
                     self.project_package_refs.push(PbxValue::reference(
                         package_ref,
-                        format!("XCRemoteSwiftPackageReference \"{name}\""),
+                        format!("XCRemoteSwiftPackageReference \"{package_comment}\""),
                     ));
                 }
             }
@@ -3292,7 +3582,15 @@ impl<'a> PbxGenerator<'a> {
             .to_owned();
         let mut object = PbxObject::new("XCSwiftPackageProductDependency", comment)
             .field("productName", PbxValue::String(product_name.to_owned()));
-        if !platform_filters.is_empty() {
+        let owner_has_supported_destinations = self
+            .project
+            .targets
+            .get(owner_name)
+            .is_some_and(|target| !target.supported_destinations.is_empty());
+        if product_name == package_name
+            && !platform_filters.is_empty()
+            && !owner_has_supported_destinations
+        {
             object = object.field("platformFilters", string_array(platform_filters));
         }
         let is_local_package = self
@@ -3448,6 +3746,20 @@ impl<'a> PbxGenerator<'a> {
             object = object.field("path", PbxValue::String(path));
         }
         object = object.field("sourceTree", PbxValue::String(source_tree.to_owned()));
+        let id = self.graph.id_for(key);
+        if let Some(existing) = self.graph.objects.get_mut(&id) {
+            for (field, value) in object.fields {
+                if field == "name"
+                    && !existing.fields.get("path").is_some_and(
+                        |path| matches!(path, PbxValue::String(value) if value.contains('/')),
+                    )
+                {
+                    continue;
+                }
+                existing.fields.entry(field).or_insert(value);
+            }
+            return id;
+        }
         self.graph.add(key, object)
     }
 
@@ -3477,8 +3789,8 @@ impl<'a> PbxGenerator<'a> {
             .clone()
             .or_else(|| path.as_deref().map(display_name))
             .unwrap_or_default();
-        let mut object =
-            PbxObject::new("PBXGroup", comment).field("children", PbxValue::Array(children));
+        let mut object = PbxObject::new("PBXGroup", comment.clone())
+            .field("children", PbxValue::Array(children));
         if let Some(name) = name {
             object = object.field("name", PbxValue::String(name));
         }
@@ -3486,40 +3798,111 @@ impl<'a> PbxGenerator<'a> {
             object = object.field("path", PbxValue::String(path));
         }
         object = object.field("sourceTree", PbxValue::String("<group>".to_owned()));
-        self.graph
-            .add_or_merge_group(&format!("group:{key}"), object)
+        let id = self
+            .graph
+            .add_or_merge_group(&format!("group:{key}"), object);
+        let sorted_children = self
+            .graph
+            .objects
+            .get(&id)
+            .and_then(|object| object.fields.get("children"))
+            .and_then(|value| match value {
+                PbxValue::Array(children) => {
+                    Some(self.sorted_group_children(&comment, children.clone()))
+                }
+                _ => None,
+            });
+        if let Some(sorted_children) = sorted_children {
+            if let Some(object) = self.graph.objects.get_mut(&id) {
+                object
+                    .fields
+                    .insert("children".to_owned(), PbxValue::Array(sorted_children));
+            }
+        }
+        id
     }
 
     fn sorted_group_children(&self, group_name: &str, children: Vec<PbxValue>) -> Vec<PbxValue> {
         if matches!(group_name, "Products" | "Carthage") {
             return children;
         }
+        let use_bottom_sort_for_unpatterned_ordering = !group_name.is_empty()
+            && self
+                .project
+                .spec_options
+                .group_ordering
+                .iter()
+                .any(|ordering| ordering.pattern.is_none())
+            && !self
+                .project
+                .spec_options
+                .group_ordering
+                .iter()
+                .any(|ordering| {
+                    ordering.pattern.is_some()
+                        && group_ordering_matches(ordering.pattern.as_deref(), group_name)
+                });
         let mut children = children;
-        children.sort_by(|left, right| {
-            let left_order = self.group_child_sort_order(left);
-            let right_order = self.group_child_sort_order(right);
-            left_order
-                .cmp(&right_order)
-                .then_with(|| {
-                    natural_cmp(
-                        &self.group_child_name_path_sort_string(left),
-                        &self.group_child_name_path_sort_string(right),
-                    )
+        let preserve_main_group_order = group_name.is_empty()
+            && self
+                .project
+                .spec_options
+                .group_ordering
+                .iter()
+                .any(|ordering| ordering.pattern.is_none());
+        if !preserve_main_group_order {
+            children.sort_by(|left, right| {
+                let left_order = self.group_child_sort_order_with_position(
+                    left,
+                    use_bottom_sort_for_unpatterned_ordering,
+                );
+                let right_order = self.group_child_sort_order_with_position(
+                    right,
+                    use_bottom_sort_for_unpatterned_ordering,
+                );
+                left_order
+                    .cmp(&right_order)
+                    .then_with(|| {
+                        natural_group_cmp(
+                            &self.group_child_name_path_sort_string(left),
+                            &self.group_child_name_path_sort_string(right),
+                        )
+                    })
+                    .then_with(|| pbx_value_id(left).cmp(&pbx_value_id(right)))
+            });
+        }
+        if children
+            .iter()
+            .any(|child| pbx_value_comment(child) == "Products")
+        {
+            let mut late = children
+                .iter()
+                .filter(|child| {
+                    matches!(pbx_value_comment(child).as_str(), "Frameworks" | "Products")
                 })
-                .then_with(|| pbx_value_id(left).cmp(&pbx_value_id(right)))
-        });
+                .cloned()
+                .collect::<Vec<_>>();
+            children.retain(|child| {
+                !matches!(pbx_value_comment(child).as_str(), "Frameworks" | "Products")
+            });
+            children.append(&mut late);
+        }
         ordered_group_children(&self.project.spec_options, group_name, children, |child| {
             self.group_child_is_group_or_folder(child)
         })
     }
 
-    fn group_child_sort_order(&self, child: &PbxValue) -> i32 {
+    fn group_child_sort_order_with_position(&self, child: &PbxValue, force_bottom: bool) -> i32 {
         if !self.group_child_is_group_or_folder(child) {
             return 0;
         }
-        match self.project.spec_options.group_sort_position {
-            GroupSortPosition::Top => -1,
-            GroupSortPosition::Bottom => 1,
+        match (
+            force_bottom,
+            effective_group_sort_position(&self.project.spec_options),
+        ) {
+            (true, _) => 1,
+            (_, &GroupSortPosition::Top) => -1,
+            (_, &GroupSortPosition::Bottom) => 1,
         }
     }
 
@@ -3531,6 +3914,8 @@ impl<'a> PbxGenerator<'a> {
             return false;
         };
         object.isa == "PBXGroup"
+            || object.isa == "PBXVariantGroup"
+            || object.isa == "XCVersionGroup"
             || object.isa == "PBXFileSystemSynchronizedRootGroup"
             || (object.isa == "PBXFileReference"
                 && object
@@ -3647,13 +4032,22 @@ impl<'a> PbxGenerator<'a> {
         let mut object = PbxObject::new("PBXShellScriptBuildPhase", name.clone())
             .field("buildActionMask", PbxValue::Int(2147483647))
             .field("files", PbxValue::Array(Vec::new()))
-            .field("inputFileListPaths", string_array(&script.input_file_lists))
-            .field("inputPaths", string_array(&script.input_files))
+            .field(
+                "inputFileListPaths",
+                string_array(&normalize_build_setting_paths(&script.input_file_lists)),
+            )
+            .field(
+                "inputPaths",
+                string_array(&normalize_build_setting_paths(&script.input_files)),
+            )
             .field(
                 "outputFileListPaths",
-                string_array(&script.output_file_lists),
+                string_array(&normalize_build_setting_paths(&script.output_file_lists)),
             )
-            .field("outputPaths", string_array(&script.output_files))
+            .field(
+                "outputPaths",
+                string_array(&normalize_build_setting_paths(&script.output_files)),
+            )
             .field(
                 "runOnlyForDeploymentPostprocessing",
                 PbxValue::Int(bool_int(script.run_only_when_installing)),
@@ -3900,7 +4294,7 @@ impl<'a> PbxGenerator<'a> {
         let info_plists = self.info_plist_files(target);
         for config in self.config_names() {
             let target_default_settings = self.target_default_build_settings(target, &config);
-            let settings = settings_by_config.entry(config).or_default();
+            let settings = settings_by_config.entry(config.clone()).or_default();
             for (key, value) in target_default_settings {
                 settings.entry(key).or_insert(value);
             }
@@ -3921,10 +4315,10 @@ impl<'a> PbxGenerator<'a> {
                     );
                 }
             }
-            if (product_type_is_app(&target.target_type)
-                || product_type_is_test(&target.target_type))
+            if product_type_is_app(&target.target_type)
                 && self.target_dependencies_require_objc_linking(target)
                 && !settings.contains_key("OTHER_LDFLAGS")
+                && !target.config_files.contains_key(&config)
             {
                 settings.insert(
                     "OTHER_LDFLAGS".to_owned(),
@@ -3986,6 +4380,13 @@ impl<'a> PbxGenerator<'a> {
                 "SDKROOT".to_owned(),
                 PbxValue::String(platform.sdk_root().to_owned()),
             );
+        } else if self
+            .project
+            .targets
+            .values()
+            .any(|target| matches!(target.platform, Platform::Auto))
+        {
+            settings.insert("SDKROOT".to_owned(), PbxValue::String("auto".to_owned()));
         }
         insert_deployment_target(
             &mut settings,
@@ -4023,6 +4424,7 @@ impl<'a> PbxGenerator<'a> {
         if !self.project.spec_options.setting_presets_none {
             insert_project_setting_presets(&mut settings, config);
         }
+        self.remove_xcconfig_defined_defaults(&mut settings, self.project.config_files.get(config));
         settings
     }
 
@@ -4092,11 +4494,106 @@ impl<'a> PbxGenerator<'a> {
             carthage_framework_search_paths(&self.project.spec_options, target)
         {
             settings.insert("FRAMEWORK_SEARCH_PATHS".to_owned(), search_paths);
+        } else if let Some(search_paths) = framework_dependency_search_paths(target) {
+            settings.insert("FRAMEWORK_SEARCH_PATHS".to_owned(), search_paths);
         }
         if !self.project.spec_options.setting_presets_none {
             insert_target_setting_presets(&mut settings, target, config, self.project);
         }
+        self.remove_target_xcconfig_defined_defaults(
+            &mut settings,
+            self.project.config_files.get(config),
+        );
+        self.remove_target_xcconfig_defined_defaults(
+            &mut settings,
+            target.config_files.get(config),
+        );
         settings
+    }
+
+    fn remove_xcconfig_defined_defaults(
+        &self,
+        settings: &mut BTreeMap<String, PbxValue>,
+        config_file: Option<&String>,
+    ) {
+        let Some(config_file) = config_file else {
+            return;
+        };
+        for key in self.xcconfig_defined_keys(config_file) {
+            settings.remove(&key);
+        }
+    }
+
+    fn remove_target_xcconfig_defined_defaults(
+        &self,
+        settings: &mut BTreeMap<String, PbxValue>,
+        config_file: Option<&String>,
+    ) {
+        let Some(config_file) = config_file else {
+            return;
+        };
+        for key in self.xcconfig_defined_keys(config_file) {
+            if target_xcconfig_preserves_default(&key) {
+                continue;
+            }
+            settings.remove(&key);
+        }
+    }
+
+    fn xcconfig_defined_keys(&self, config_file: &str) -> HashSet<String> {
+        let mut keys = HashSet::new();
+        let mut seen = HashSet::new();
+        self.collect_xcconfig_defined_keys(
+            &self.project.base_path.join(config_file),
+            &mut seen,
+            &mut keys,
+        );
+        keys
+    }
+
+    fn collect_xcconfig_defined_keys(
+        &self,
+        path: &Path,
+        seen: &mut HashSet<PathBuf>,
+        keys: &mut HashSet<String>,
+    ) {
+        if !seen.insert(path.to_path_buf()) {
+            return;
+        }
+        let Ok(contents) = fs::read_to_string(path) else {
+            return;
+        };
+        for line in contents.lines() {
+            let line = line
+                .split_once("//")
+                .map_or(line, |(prefix, _)| prefix)
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(include) = xcconfig_include_path(line) {
+                let parent_candidate = path
+                    .parent()
+                    .unwrap_or(&self.project.base_path)
+                    .join(&include);
+                let include_path = if parent_candidate.exists() {
+                    parent_candidate
+                } else {
+                    self.project.base_path.join(include)
+                };
+                self.collect_xcconfig_defined_keys(&include_path, seen, keys);
+                continue;
+            }
+            if let Some((key, _)) = line.split_once('=') {
+                let key = key
+                    .trim()
+                    .split_once('[')
+                    .map_or_else(|| key.trim(), |(base, _)| base.trim());
+                if !key.is_empty() {
+                    keys.insert(key.to_owned());
+                }
+            }
+        }
     }
 
     fn build_settings_for_config(
@@ -4157,7 +4654,7 @@ impl<'a> PbxGenerator<'a> {
         files
     }
 
-    fn serialize(&self, root_id: &str) -> String {
+    fn serialize_with_id_map(&self, root_id: &str) -> (String, HashMap<String, String>) {
         let id_map = self.xcode_reference_map(root_id);
         let mut output = String::new();
         output.push_str("// !$*UTF8*$!\n{\n");
@@ -4223,7 +4720,7 @@ impl<'a> PbxGenerator<'a> {
             "\trootObject = {} /* Project object */;\n}}",
             mapped_id(root_id, &id_map)
         );
-        output
+        (output, id_map)
     }
 
     fn xcode_reference_map(&self, root_id: &str) -> HashMap<String, String> {
@@ -4265,12 +4762,19 @@ fn write_plist(
         .map_err(|source| ProjectWriteError::Write { path, source })
 }
 
-fn write_schemes(project: &Project, project_path: &Path) -> Result<(), ProjectWriteError> {
+fn write_schemes(
+    project: &Project,
+    project_path: &Path,
+    object_id_map: &HashMap<String, String>,
+) -> Result<(), ProjectWriteError> {
     let schemes_dir = project_path.join("xcshareddata/xcschemes");
     let mut schemes = Vec::new();
     for scheme in project.scheme_specs.values() {
         if scheme.management.shared {
-            schemes.push((scheme.name.clone(), scheme_xml(project, scheme)));
+            schemes.push((
+                scheme.name.clone(),
+                scheme_xml(project, scheme, object_id_map),
+            ));
         }
     }
     for target in project.targets.values() {
@@ -4292,7 +4796,7 @@ fn write_schemes(project: &Project, project_path: &Path) -> Result<(), ProjectWr
                 .unwrap_or_else(|| target.name.clone());
             schemes.push((
                 name.clone(),
-                target_scheme_xml(project, target, target_scheme, variant),
+                target_scheme_xml(project, target, target_scheme, variant, object_id_map),
             ));
         }
     }
@@ -4418,20 +4922,25 @@ fn scheme_management_plist(states: &[SchemeManagementState]) -> String {
     output
 }
 
-fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
+fn scheme_xml(
+    project: &Project,
+    scheme: &crate::spec::Scheme,
+    object_id_map: &HashMap<String, String>,
+) -> String {
     let debug_config = default_config_for(project, "debug");
     let release_config = default_config_for(project, "release");
-    let runnable = first_runnable_scheme_target(project, &scheme.build.targets).or_else(|| {
-        scheme
-            .build
-            .targets
-            .first()
-            .map(|target| target.target.as_str())
-    });
+    let runnable = first_runnable_scheme_target(project, &scheme.build.targets);
+    let primary_build_target = scheme
+        .build
+        .targets
+        .first()
+        .map(|target| target.target.as_str());
+    let default_macro_expansion = runnable.is_none().then_some(()).and(primary_build_target);
     let run_macro_expansion = scheme
         .run
         .as_ref()
-        .and_then(|run| run.macro_expansion.as_deref());
+        .and_then(|run| run.macro_expansion.as_deref())
+        .or(default_macro_expansion);
     let testing_macro_expansion =
         first_testing_runnable_scheme_target(project, &scheme.build.targets);
     let test_macro_expansion = scheme
@@ -4439,15 +4948,25 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
         .as_ref()
         .and_then(|test| test.macro_expansion.as_deref())
         .or(testing_macro_expansion)
-        .or(run_macro_expansion);
+        .or(run_macro_expansion)
+        .or(primary_build_target);
+    let empty_command_line_arguments = indexmap::IndexMap::new();
+    let emit_empty_test_command_line_arguments = scheme.test.is_some();
     let mut output = String::new();
     output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    let _ = writeln!(
-        output,
-        "<Scheme LastUpgradeVersion=\"{}\" version=\"1.7\">",
-        xml_escape(&scheme_last_upgrade_version(project))
-    );
-    write_build_action(&mut output, project, &scheme.build, 1);
+    let mut scheme_attrs = vec![(
+        "LastUpgradeVersion",
+        xml_escape(&scheme_last_upgrade_version(project)),
+    )];
+    if primary_build_target
+        .and_then(|target| project.targets.get(target))
+        .is_some_and(|target| scheme_target_is_app_extension(&target.target_type))
+    {
+        scheme_attrs.push(("wasCreatedForAppExtension", "YES".to_owned()));
+    }
+    scheme_attrs.push(("version", "1.7".to_owned()));
+    write_multiline_start(&mut output, 0, "Scheme", &scheme_attrs);
+    write_build_action(&mut output, project, &scheme.build, object_id_map, 1);
     write_test_action(
         &mut output,
         project,
@@ -4476,6 +4995,16 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
             .test
             .as_ref()
             .and_then(|test| test.custom_lldb_init.as_deref()),
+        scheme
+            .test
+            .as_ref()
+            .map(|test| test.pre_actions.as_slice())
+            .unwrap_or(&[]),
+        scheme
+            .test
+            .as_ref()
+            .map(|test| test.post_actions.as_slice())
+            .unwrap_or(&[]),
         test_macro_expansion,
         scheme
             .test
@@ -4500,6 +5029,12 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
         scheme
             .test
             .as_ref()
+            .map(|test| &test.command_line_arguments)
+            .unwrap_or(&empty_command_line_arguments),
+        emit_empty_test_command_line_arguments,
+        scheme
+            .test
+            .as_ref()
             .and_then(|test| test.capture_screenshots_automatically),
         scheme
             .test
@@ -4510,9 +5045,9 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
             .as_ref()
             .and_then(|test| test.preferred_screen_capture_format.as_deref()),
         &debug_config,
+        object_id_map,
         1,
     );
-    let empty_command_line_arguments = indexmap::IndexMap::new();
     write_launch_action(
         &mut output,
         project,
@@ -4573,6 +5108,7 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
             .as_ref()
             .map(|run| &run.command_line_arguments)
             .unwrap_or(&empty_command_line_arguments),
+        scheme.run.is_some(),
         scheme.run.as_ref().and_then(|run| run.language.as_deref()),
         scheme.run.as_ref().and_then(|run| run.region.as_deref()),
         scheme
@@ -4581,6 +5117,7 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
             .map(|run| run.environment_variables.as_slice())
             .unwrap_or(&[]),
         &debug_config,
+        object_id_map,
         1,
     );
     write_profile_action(
@@ -4601,7 +5138,10 @@ fn scheme_xml(project: &Project, scheme: &crate::spec::Scheme) -> String {
             .as_ref()
             .map(|profile| profile.ask_for_app_to_launch)
             .unwrap_or(false),
+        scheme.profile.is_some(),
+        default_macro_expansion,
         &release_config,
+        object_id_map,
         1,
     );
     write_simple_action(
@@ -4635,6 +5175,7 @@ fn target_scheme_xml(
     target: &Target,
     scheme: &crate::spec::TargetScheme,
     variant: Option<&str>,
+    object_id_map: &HashMap<String, String>,
 ) -> String {
     let debug_config = variant_config(project, variant, "debug");
     let release_config = variant_config(project, variant, "release");
@@ -4673,27 +5214,31 @@ fn target_scheme_xml(
         post_actions: scheme.post_actions.clone(),
         ..Default::default()
     };
-    let test_targets = scheme
-        .test_targets
-        .iter()
-        .map(|name| crate::spec::SchemeTestTarget {
-            target_reference: name.clone(),
-            random_execution_order: false,
-            parallelizable: false,
-            location: None,
-            skipped: false,
-            skipped_tests: Vec::new(),
-            selected_tests: Vec::new(),
-        })
-        .collect::<Vec<_>>();
+    let test_targets = scheme.test_target_options.clone();
+    let runnable = runnable_scheme_target(target).then_some(target.name.as_str());
+    let macro_expansion = (!runnable_scheme_target(target)).then_some(target.name.as_str());
+    let empty_command_line_arguments = indexmap::IndexMap::new();
     let mut output = String::new();
     output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    let _ = writeln!(
-        output,
-        "<Scheme LastUpgradeVersion=\"{}\" version=\"1.7\">",
-        xml_escape(&scheme_last_upgrade_version(project))
-    );
-    write_build_action(&mut output, project, &build, 1);
+    let mut scheme_attrs = vec![(
+        "LastUpgradeVersion",
+        xml_escape(&scheme_last_upgrade_version(project)),
+    )];
+    if matches!(
+        target.target_type,
+        ProductType::AppExtension
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
+            | ProductType::MessagesExtension
+            | ProductType::WatchExtension
+            | ProductType::Watch2Extension
+            | ProductType::TvExtension
+    ) {
+        scheme_attrs.push(("wasCreatedForAppExtension", "YES".to_owned()));
+    }
+    scheme_attrs.push(("version", "1.7".to_owned()));
+    write_multiline_start(&mut output, 0, "Scheme", &scheme_attrs);
+    write_build_action(&mut output, project, &build, object_id_map, 1);
     write_test_action(
         &mut output,
         project,
@@ -4703,21 +5248,26 @@ fn target_scheme_xml(
         scheme.disable_main_thread_checker,
         scheme.stop_on_every_main_thread_checker_issue,
         None,
-        None,
+        &[],
+        &[],
+        Some(&target.name),
         &test_targets,
         &scheme.coverage_targets,
         &scheme.test_plans,
         &scheme.environment_variables,
+        &empty_command_line_arguments,
+        true,
         None,
         None,
         None,
         &debug_config,
+        object_id_map,
         1,
     );
     write_launch_action(
         &mut output,
         project,
-        Some(&target.name),
+        runnable,
         Some(&debug_config),
         true,
         None,
@@ -4726,26 +5276,31 @@ fn target_scheme_xml(
         None,
         None,
         scheme.store_kit_configuration.as_deref(),
-        None,
+        macro_expansion,
         None,
         scheme.disable_main_thread_checker,
         scheme.stop_on_every_main_thread_checker_issue,
         scheme.disable_thread_performance_checker,
         &scheme.command_line_arguments,
+        scheme.gather_coverage_data,
         scheme.language.as_deref(),
         scheme.region.as_deref(),
         &scheme.environment_variables,
         &debug_config,
+        object_id_map,
         1,
     );
     write_profile_action(
         &mut output,
         project,
-        Some(&target.name),
+        runnable,
         Some(&release_config),
         &scheme.environment_variables,
         false,
+        scheme.gather_coverage_data,
+        macro_expansion,
         &release_config,
+        object_id_map,
         1,
     );
     write_simple_action(
@@ -4770,37 +5325,50 @@ fn write_build_action(
     output: &mut String,
     project: &Project,
     build: &crate::spec::SchemeBuild,
+    object_id_map: &HashMap<String, String>,
     indent: usize,
 ) {
-    write_indent(output, indent);
-    let _ = writeln!(
+    write_multiline_start(
         output,
-        "<BuildAction parallelizeBuildables=\"{}\" buildImplicitDependencies=\"{}\" runPostActionsOnFailure=\"{}\">",
-        bool_xml(build.parallelize_build),
-        bool_xml(build.build_implicit_dependencies),
-        bool_xml(build.run_post_actions_on_failure)
+        indent,
+        "BuildAction",
+        &[
+            (
+                "parallelizeBuildables",
+                bool_xml(build.parallelize_build).to_owned(),
+            ),
+            (
+                "buildImplicitDependencies",
+                bool_xml(build.build_implicit_dependencies).to_owned(),
+            ),
+            (
+                "runPostActionsOnFailure",
+                bool_xml(build.run_post_actions_on_failure).to_owned(),
+            ),
+        ],
     );
     for action in &build.pre_actions {
-        write_execution_action(output, project, "PreActions", action, indent + 1);
+        write_execution_action(
+            output,
+            project,
+            "PreActions",
+            action,
+            object_id_map,
+            indent + 1,
+        );
     }
     write_indent(output, indent + 1);
     output.push_str("<BuildActionEntries>\n");
     for target in &build.targets {
         if let Some(project_target) = project.targets.get(&target.target) {
-            write_indent(output, indent + 2);
-            output.push_str("<BuildActionEntry");
-            write_build_for_attributes(output, &target.build_types);
-            output.push_str(">\n");
-            write_buildable_reference(output, project, project_target, indent + 3);
+            write_build_action_entry_start(output, indent + 2, &target.build_types);
+            write_buildable_reference(output, project, project_target, object_id_map, indent + 3);
             write_indent(output, indent + 2);
             output.push_str("</BuildActionEntry>\n");
         } else if let Some((target_name, container)) =
             project_reference_target(project, &target.target)
         {
-            write_indent(output, indent + 2);
-            output.push_str("<BuildActionEntry");
-            write_build_for_attributes(output, &target.build_types);
-            output.push_str(">\n");
+            write_build_action_entry_start(output, indent + 2, &target.build_types);
             write_external_buildable_reference(output, target_name, container, indent + 3);
             write_indent(output, indent + 2);
             output.push_str("</BuildActionEntry>\n");
@@ -4809,7 +5377,14 @@ fn write_build_action(
     write_indent(output, indent + 1);
     output.push_str("</BuildActionEntries>\n");
     for action in &build.post_actions {
-        write_execution_action(output, project, "PostActions", action, indent + 1);
+        write_execution_action(
+            output,
+            project,
+            "PostActions",
+            action,
+            object_id_map,
+            indent + 1,
+        );
     }
     write_indent(output, indent);
     output.push_str("</BuildAction>\n");
@@ -4825,18 +5400,22 @@ fn write_test_action(
     disable_main_thread_checker: bool,
     stop_on_every_main_thread_checker_issue: bool,
     custom_lldb_init: Option<&str>,
+    pre_actions: &[crate::spec::SchemeAction],
+    post_actions: &[crate::spec::SchemeAction],
     macro_expansion: Option<&str>,
     test_targets: &[crate::spec::SchemeTestTarget],
     coverage_targets: &[String],
     test_plans: &[crate::spec::TestPlan],
     environment_variables: &[crate::spec::EnvironmentVariable],
+    command_line_arguments: &indexmap::IndexMap<String, bool>,
+    emit_empty_command_line_arguments: bool,
     capture_screenshots_automatically: Option<bool>,
     delete_screenshots_when_each_test_succeeds: Option<bool>,
     preferred_screen_capture_format: Option<&str>,
     default_config: &str,
+    object_id_map: &HashMap<String, String>,
     indent: usize,
 ) {
-    write_indent(output, indent);
     let system_attachment_lifetime = match (
         capture_screenshots_automatically,
         delete_screenshots_when_each_test_succeeds,
@@ -4845,25 +5424,76 @@ fn write_test_action(
         (Some(true), Some(false)) => Some("keepAlways"),
         _ => None,
     };
-    let _ = writeln!(
-        output,
-        "<TestAction buildConfiguration=\"{}\" selectedDebuggerIdentifier=\"{}\" selectedLauncherIdentifier=\"{}\" shouldUseLaunchSchemeArgsEnv=\"YES\" codeCoverageEnabled=\"{}\" disableMainThreadChecker=\"{}\" stopOnEveryMainThreadCheckerIssue=\"{}\"{}{}{}>",
-        xml_escape(config.unwrap_or(default_config)),
-        if debug_enabled { "Xcode.DebuggerFoundation.Debugger.LLDB" } else { "" },
-        if debug_enabled { "Xcode.DebuggerFoundation.Launcher.LLDB" } else { "Xcode.IDEFoundation.Launcher.PosixSpawn" },
-        bool_xml(gather_coverage_data),
-        bool_xml(disable_main_thread_checker),
-        bool_xml(stop_on_every_main_thread_checker_issue),
-        system_attachment_lifetime
-            .map(|value| format!(" systemAttachmentLifetime=\"{value}\""))
-            .unwrap_or_default(),
-        preferred_screen_capture_format
-            .map(|value| format!(" preferredScreenCaptureFormat=\"{}\"", xml_escape(value)))
-            .unwrap_or_default(),
-        custom_lldb_init
-            .map(|value| format!(" customLLDBInitFile=\"{}\"", xml_escape(value)))
-            .unwrap_or_default()
-    );
+    let mut attrs = vec![
+        (
+            "buildConfiguration",
+            xml_escape(config.unwrap_or(default_config)),
+        ),
+        (
+            "selectedDebuggerIdentifier",
+            if debug_enabled {
+                "Xcode.DebuggerFoundation.Debugger.LLDB"
+            } else {
+                ""
+            }
+            .to_owned(),
+        ),
+        (
+            "selectedLauncherIdentifier",
+            if debug_enabled {
+                "Xcode.DebuggerFoundation.Launcher.LLDB"
+            } else {
+                "Xcode.IDEFoundation.Launcher.PosixSpawn"
+            }
+            .to_owned(),
+        ),
+        (
+            "shouldUseLaunchSchemeArgsEnv",
+            if command_line_arguments.is_empty() && environment_variables.is_empty() {
+                "YES"
+            } else {
+                "NO"
+            }
+            .to_owned(),
+        ),
+    ];
+    if gather_coverage_data {
+        if disable_main_thread_checker {
+            attrs.push(("disableMainThreadChecker", "YES".to_owned()));
+        }
+        attrs.push(("codeCoverageEnabled", "YES".to_owned()));
+    } else if disable_main_thread_checker {
+        attrs.push(("disableMainThreadChecker", "YES".to_owned()));
+    }
+    if !coverage_targets.is_empty() && gather_coverage_data {
+        attrs.push(("onlyGenerateCoverageForSpecifiedTargets", "YES".to_owned()));
+    } else {
+        attrs.push(("onlyGenerateCoverageForSpecifiedTargets", "NO".to_owned()));
+    }
+    if stop_on_every_main_thread_checker_issue {
+        attrs.push(("stopOnEveryMainThreadCheckerIssue", "YES".to_owned()));
+    }
+    if let Some(value) = system_attachment_lifetime {
+        attrs.push(("systemAttachmentLifetime", value.to_owned()));
+    }
+    if let Some(value) = preferred_screen_capture_format {
+        attrs.push(("preferredScreenCaptureFormat", xml_escape(value)));
+    }
+    if let Some(value) = custom_lldb_init {
+        attrs.push(("customLLDBInitFile", xml_escape(value)));
+    }
+    write_multiline_start(output, indent, "TestAction", &attrs);
+    for action in pre_actions {
+        write_execution_action(
+            output,
+            project,
+            "PreActions",
+            action,
+            object_id_map,
+            indent + 1,
+        );
+    }
+    write_macro_expansion(output, project, macro_expansion, object_id_map, indent + 1);
     write_indent(output, indent + 1);
     output.push_str("<Testables>\n");
     for test_target in test_targets {
@@ -4875,16 +5505,19 @@ fn write_test_action(
         if project.targets.contains_key(target_name)
             || package_test_reference(project, &test_target.target_reference).is_some()
         {
-            write_indent(output, indent + 2);
-            let _ = writeln!(
-                output,
-                "<TestableReference skipped=\"{}\" parallelizable=\"{}\" testExecutionOrdering=\"{}\">",
-                bool_xml(test_target.skipped),
-                bool_xml(test_target.parallelizable),
-                if test_target.random_execution_order { "random" } else { "" }
-            );
+            let mut attrs = vec![
+                ("skipped", bool_xml(test_target.skipped).to_owned()),
+                (
+                    "parallelizable",
+                    bool_xml(test_target.parallelizable).to_owned(),
+                ),
+            ];
+            if test_target.random_execution_order {
+                attrs.push(("testExecutionOrdering", "random".to_owned()));
+            }
+            write_multiline_start(output, indent + 2, "TestableReference", &attrs);
             if let Some(target) = project.targets.get(target_name) {
-                write_buildable_reference(output, project, target, indent + 3);
+                write_buildable_reference(output, project, target, object_id_map, indent + 3);
             } else {
                 write_package_test_buildable_reference(
                     output,
@@ -4929,12 +5562,19 @@ fn write_test_action(
         write_indent(output, indent + 1);
         output.push_str("</TestPlans>\n");
     }
+    if !command_line_arguments.is_empty()
+        || !environment_variables.is_empty()
+        || emit_empty_command_line_arguments
+    {
+        write_command_line_arguments(output, command_line_arguments, indent + 1);
+    }
+    write_environment_variables(output, environment_variables, indent + 1);
     if !coverage_targets.is_empty() {
         write_indent(output, indent + 1);
         output.push_str("<CodeCoverageTargets>\n");
         for target_name in coverage_targets {
             if let Some(target) = project.targets.get(target_name) {
-                write_buildable_reference(output, project, target, indent + 2);
+                write_buildable_reference(output, project, target, object_id_map, indent + 2);
             } else if let Some((external_target, container)) =
                 project_reference_target(project, target_name)
             {
@@ -4946,8 +5586,16 @@ fn write_test_action(
         write_indent(output, indent + 1);
         output.push_str("</CodeCoverageTargets>\n");
     }
-    write_macro_expansion(output, project, macro_expansion, indent + 1);
-    write_environment_variables(output, environment_variables, indent + 1);
+    for action in post_actions {
+        write_execution_action(
+            output,
+            project,
+            "PostActions",
+            action,
+            object_id_map,
+            indent + 1,
+        );
+    }
     write_indent(output, indent);
     output.push_str("</TestAction>\n");
 }
@@ -4971,49 +5619,97 @@ fn write_launch_action(
     stop_on_every_main_thread_checker_issue: bool,
     disable_thread_performance_checker: bool,
     command_line_arguments: &indexmap::IndexMap<String, bool>,
+    emit_empty_command_line_arguments: bool,
     language: Option<&str>,
     region: Option<&str>,
     environment_variables: &[crate::spec::EnvironmentVariable],
     default_config: &str,
+    object_id_map: &HashMap<String, String>,
     indent: usize,
 ) {
-    write_indent(output, indent);
-    let _ = writeln!(
-        output,
-        "<LaunchAction buildConfiguration=\"{}\" selectedDebuggerIdentifier=\"{}\" selectedLauncherIdentifier=\"{}\" launchStyle=\"0\" useCustomWorkingDirectory=\"{}\"{}{}{}{}{}{} ignoresPersistentStateOnLaunch=\"NO\" debugDocumentVersioning=\"YES\" debugServiceExtension=\"internal\" allowLocationSimulation=\"YES\"{} disableMainThreadChecker=\"{}\" stopOnEveryMainThreadCheckerIssue=\"{}\" disableThreadPerformanceChecker=\"{}\">",
-        xml_escape(config.unwrap_or(default_config)),
-        if debug_enabled { "Xcode.DebuggerFoundation.Debugger.LLDB" } else { "" },
-        if debug_enabled { "Xcode.DebuggerFoundation.Launcher.LLDB" } else { "Xcode.IDEFoundation.Launcher.PosixSpawn" },
-        bool_xml(custom_working_directory.is_some()),
-        custom_working_directory
-            .map(|value| format!(" customWorkingDirectory=\"{}\"", xml_escape(value)))
-            .unwrap_or_default(),
-        if ask_for_app_to_launch { " askForAppToLaunch=\"YES\"" } else { "" },
-        custom_lldb_init
-            .map(|value| format!(" customLLDBInitFile=\"{}\"", xml_escape(value)))
-            .unwrap_or_default(),
-        enable_gpu_frame_capture_mode
-            .map(|value| format!(" enableGPUFrameCaptureMode=\"{}\"", xml_escape(value)))
-            .unwrap_or_default(),
-        language
-            .map(|value| format!(" language=\"{}\"", xml_escape(value)))
-            .unwrap_or_default(),
-        region
-            .map(|value| format!(" region=\"{}\"", xml_escape(value)))
-            .unwrap_or_default(),
-        launch_automatically_substyle.map(|value| format!(" launchAutomaticallySubstyle=\"{}\"", xml_escape(value))).unwrap_or_default(),
-        bool_xml(disable_main_thread_checker),
-        bool_xml(stop_on_every_main_thread_checker_issue),
-        bool_xml(disable_thread_performance_checker)
-    );
+    let mut attrs = vec![
+        (
+            "buildConfiguration",
+            xml_escape(config.unwrap_or(default_config)),
+        ),
+        (
+            "selectedDebuggerIdentifier",
+            if debug_enabled {
+                "Xcode.DebuggerFoundation.Debugger.LLDB"
+            } else {
+                ""
+            }
+            .to_owned(),
+        ),
+        (
+            "selectedLauncherIdentifier",
+            if debug_enabled {
+                "Xcode.DebuggerFoundation.Launcher.LLDB"
+            } else {
+                "Xcode.IDEFoundation.Launcher.PosixSpawn"
+            }
+            .to_owned(),
+        ),
+    ];
+    if disable_main_thread_checker {
+        attrs.push(("disableMainThreadChecker", "YES".to_owned()));
+    }
+    attrs.push(("launchStyle", "0".to_owned()));
+    if ask_for_app_to_launch {
+        attrs.push(("askForAppToLaunch", "YES".to_owned()));
+    }
+    attrs.push((
+        "useCustomWorkingDirectory",
+        bool_xml(custom_working_directory.is_some()).to_owned(),
+    ));
+    if let Some(value) = custom_working_directory {
+        attrs.push(("customWorkingDirectory", xml_escape(value)));
+    }
+    if let Some(value) = custom_lldb_init {
+        attrs.push(("customLLDBInitFile", xml_escape(value)));
+    }
+    if let Some(value) = enable_gpu_frame_capture_mode {
+        attrs.push(("enableGPUFrameCaptureMode", xml_escape(value)));
+    }
+    if let Some(value) = language {
+        attrs.push(("language", xml_escape(value)));
+    }
+    if let Some(value) = region {
+        attrs.push(("region", xml_escape(value)));
+    }
+    attrs.extend([
+        ("ignoresPersistentStateOnLaunch", "NO".to_owned()),
+        ("debugDocumentVersioning", "YES".to_owned()),
+        ("debugServiceExtension", "internal".to_owned()),
+        ("allowLocationSimulation", "YES".to_owned()),
+    ]);
+    if let Some(value) = launch_automatically_substyle {
+        attrs.push(("launchAutomaticallySubstyle", xml_escape(value)));
+    }
+    if stop_on_every_main_thread_checker_issue {
+        attrs.push(("stopOnEveryMainThreadCheckerIssue", "YES".to_owned()));
+    }
+    if disable_thread_performance_checker {
+        attrs.push(("disableThreadPerformanceChecker", "YES".to_owned()));
+    }
+    write_multiline_start(output, indent, "LaunchAction", &attrs);
     if let Some(target_name) = runnable.and_then(|name| project.targets.get(name)) {
-        write_indent(output, indent + 1);
         if is_watch_app_product(&target_name.target_type) {
-            output.push_str("<RemoteRunnable runnableDebuggingMode=\"2\">\n");
+            write_multiline_start(
+                output,
+                indent + 1,
+                "RemoteRunnable",
+                &[("runnableDebuggingMode", "2".to_owned())],
+            );
         } else {
-            output.push_str("<BuildableProductRunnable runnableDebuggingMode=\"0\">\n");
+            write_multiline_start(
+                output,
+                indent + 1,
+                "BuildableProductRunnable",
+                &[("runnableDebuggingMode", "0".to_owned())],
+            );
         }
-        write_buildable_reference(output, project, target_name, indent + 2);
+        write_buildable_reference(output, project, target_name, object_id_map, indent + 2);
         write_indent(output, indent + 1);
         if is_watch_app_product(&target_name.target_type) {
             output.push_str("</RemoteRunnable>\n");
@@ -5029,7 +5725,7 @@ fn write_launch_action(
             xml_escape(&scheme_prefixed_path(project, store_kit_configuration))
         );
     }
-    write_macro_expansion(output, project, macro_expansion, indent + 1);
+    write_macro_expansion(output, project, macro_expansion, object_id_map, indent + 1);
     if let Some(simulate_location) = simulate_location {
         if let Some(identifier) = &simulate_location.default_location {
             write_indent(output, indent + 1);
@@ -5047,7 +5743,12 @@ fn write_launch_action(
             );
         }
     }
-    write_command_line_arguments(output, command_line_arguments, indent + 1);
+    if !command_line_arguments.is_empty()
+        || !environment_variables.is_empty()
+        || emit_empty_command_line_arguments
+    {
+        write_command_line_arguments(output, command_line_arguments, indent + 1);
+    }
     write_environment_variables(output, environment_variables, indent + 1);
     write_indent(output, indent);
     output.push_str("</LaunchAction>\n");
@@ -5061,23 +5762,49 @@ fn write_profile_action(
     config: Option<&str>,
     environment_variables: &[crate::spec::EnvironmentVariable],
     ask_for_app_to_launch: bool,
+    emit_empty_command_line_arguments: bool,
+    macro_expansion: Option<&str>,
     default_config: &str,
+    object_id_map: &HashMap<String, String>,
     indent: usize,
 ) {
-    write_indent(output, indent);
-    let _ = writeln!(
-        output,
-        "<ProfileAction buildConfiguration=\"{}\" shouldUseLaunchSchemeArgsEnv=\"YES\" savedToolIdentifier=\"\" useCustomWorkingDirectory=\"NO\" debugDocumentVersioning=\"YES\"{}>",
-        xml_escape(config.unwrap_or(default_config)),
-        if ask_for_app_to_launch { " askForAppToLaunch=\"YES\"" } else { "" }
-    );
+    let mut attrs = vec![
+        (
+            "buildConfiguration",
+            xml_escape(config.unwrap_or(default_config)),
+        ),
+        (
+            "shouldUseLaunchSchemeArgsEnv",
+            if environment_variables.is_empty() {
+                "YES"
+            } else {
+                "NO"
+            }
+            .to_owned(),
+        ),
+        ("savedToolIdentifier", String::new()),
+        ("useCustomWorkingDirectory", "NO".to_owned()),
+        ("debugDocumentVersioning", "YES".to_owned()),
+    ];
+    if ask_for_app_to_launch {
+        attrs.push(("askForAppToLaunch", "YES".to_owned()));
+    }
+    write_multiline_start(output, indent, "ProfileAction", &attrs);
     if let Some(target) = runnable.and_then(|name| project.targets.get(name)) {
-        write_indent(output, indent + 1);
-        output.push_str("<BuildableProductRunnable runnableDebuggingMode=\"0\">\n");
-        write_buildable_reference(output, project, target, indent + 2);
+        write_multiline_start(
+            output,
+            indent + 1,
+            "BuildableProductRunnable",
+            &[("runnableDebuggingMode", "0".to_owned())],
+        );
+        write_buildable_reference(output, project, target, object_id_map, indent + 2);
         write_indent(output, indent + 1);
         output.push_str("</BuildableProductRunnable>\n");
     }
+    if !environment_variables.is_empty() || emit_empty_command_line_arguments {
+        write_command_line_arguments(output, &indexmap::IndexMap::new(), indent + 1);
+    }
+    write_macro_expansion(output, project, macro_expansion, object_id_map, indent + 1);
     write_environment_variables(output, environment_variables, indent + 1);
     write_indent(output, indent);
     output.push_str("</ProfileAction>\n");
@@ -5090,12 +5817,13 @@ fn write_simple_action(
     config: &str,
     indent: usize,
 ) {
+    let mut attrs = vec![(attribute, xml_escape(config))];
+    if element == "ArchiveAction" {
+        attrs.push(("revealArchiveInOrganizer", "YES".to_owned()));
+    }
+    write_multiline_start(output, indent, element, &attrs);
     write_indent(output, indent);
-    let _ = writeln!(
-        output,
-        "<{element} {attribute}=\"{}\"/>",
-        xml_escape(config)
-    );
+    let _ = writeln!(output, "</{element}>");
 }
 
 fn write_execution_action(
@@ -5103,28 +5831,40 @@ fn write_execution_action(
     project: &Project,
     container: &str,
     action: &crate::spec::SchemeAction,
+    object_id_map: &HashMap<String, String>,
     indent: usize,
 ) {
     write_indent(output, indent);
     let _ = writeln!(output, "<{container}>");
-    write_indent(output, indent + 1);
-    let _ = writeln!(
+    write_multiline_start(
         output,
-        "<ExecutionAction ActionType=\"Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction\">"
+        indent + 1,
+        "ExecutionAction",
+        &[(
+            "ActionType",
+            "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction"
+                .to_owned(),
+        )],
     );
-    write_indent(output, indent + 2);
-    let _ = writeln!(
+    write_multiline_start(
         output,
-        "<ActionContent title=\"{}\" scriptText=\"{}\">",
-        xml_escape(&action.name),
-        xml_escape(&action.script)
+        indent + 2,
+        "ActionContent",
+        &[
+            ("title", xml_escape(&action.name)),
+            ("scriptText", xml_escape(&action.script)),
+        ],
     );
     if let Some(target) = action
         .settings_target
         .as_ref()
         .and_then(|target| project.targets.get(target))
     {
-        write_buildable_reference(output, project, target, indent + 3);
+        write_indent(output, indent + 3);
+        output.push_str("<EnvironmentBuildable>\n");
+        write_buildable_reference(output, project, target, object_id_map, indent + 4);
+        write_indent(output, indent + 3);
+        output.push_str("</EnvironmentBuildable>\n");
     }
     write_indent(output, indent + 2);
     output.push_str("</ActionContent>\n");
@@ -5138,17 +5878,27 @@ fn write_buildable_reference(
     output: &mut String,
     project: &Project,
     target: &Target,
+    object_id_map: &HashMap<String, String>,
     indent: usize,
 ) {
-    write_indent(output, indent);
-    let _ = writeln!(
+    let raw_id = object_id(&format!("nativeTarget:{}", target.name), 0);
+    write_multiline_start(
         output,
-        "<BuildableReference BuildableIdentifier=\"primary\" BlueprintIdentifier=\"{}\" BuildableName=\"{}\" BlueprintName=\"{}\" ReferencedContainer=\"container:{}.xcodeproj\"/>",
-        object_id(&format!("nativeTarget:{}", target.name), 0),
-        xml_escape(&target.filename()),
-        xml_escape(&target.name),
-        xml_escape(&project.name)
+        indent,
+        "BuildableReference",
+        &[
+            ("BuildableIdentifier", "primary".to_owned()),
+            ("BlueprintIdentifier", mapped_id(&raw_id, object_id_map)),
+            ("BuildableName", xml_escape(&target.filename())),
+            ("BlueprintName", xml_escape(&target.name)),
+            (
+                "ReferencedContainer",
+                format!("container:{}.xcodeproj", xml_escape(&project.name)),
+            ),
+        ],
     );
+    write_indent(output, indent);
+    output.push_str("</BuildableReference>\n");
 }
 
 fn write_external_buildable_reference(
@@ -5216,6 +5966,7 @@ fn write_macro_expansion(
     output: &mut String,
     project: &Project,
     target_name: Option<&str>,
+    object_id_map: &HashMap<String, String>,
     indent: usize,
 ) {
     let Some(target) = target_name.and_then(|name| project.targets.get(name)) else {
@@ -5223,7 +5974,7 @@ fn write_macro_expansion(
     };
     write_indent(output, indent);
     output.push_str("<MacroExpansion>\n");
-    write_buildable_reference(output, project, target, indent + 1);
+    write_buildable_reference(output, project, target, object_id_map, indent + 1);
     write_indent(output, indent);
     output.push_str("</MacroExpansion>\n");
 }
@@ -5239,17 +5990,34 @@ fn write_environment_variables(
     write_indent(output, indent);
     output.push_str("<EnvironmentVariables>\n");
     for variable in variables {
-        write_indent(output, indent + 1);
-        let _ = writeln!(
+        write_multiline_start(
             output,
-            "<EnvironmentVariable key=\"{}\" value=\"{}\" isEnabled=\"{}\"/>",
-            xml_escape(&variable.variable),
-            xml_escape(&variable.value),
-            bool_xml(variable.enabled)
+            indent + 1,
+            "EnvironmentVariable",
+            &[
+                ("key", xml_escape(&variable.variable)),
+                ("value", xml_escape(&variable.value)),
+                ("isEnabled", bool_xml(variable.enabled).to_owned()),
+            ],
         );
+        write_indent(output, indent + 1);
+        output.push_str("</EnvironmentVariable>\n");
     }
     write_indent(output, indent);
     output.push_str("</EnvironmentVariables>\n");
+}
+
+fn runnable_scheme_target(target: &Target) -> bool {
+    matches!(
+        target.target_type,
+        ProductType::Application
+            | ProductType::OnDemandInstallCapableApplication
+            | ProductType::WatchApp
+            | ProductType::Watch2App
+            | ProductType::CommandLineTool
+            | ProductType::AppExtension
+            | ProductType::ExtensionKitExtension
+    )
 }
 
 fn write_command_line_arguments(
@@ -5257,36 +6025,41 @@ fn write_command_line_arguments(
     arguments: &indexmap::IndexMap<String, bool>,
     indent: usize,
 ) {
-    if arguments.is_empty() {
-        return;
-    }
     write_indent(output, indent);
     output.push_str("<CommandLineArguments>\n");
     for (argument, enabled) in arguments {
-        write_indent(output, indent + 1);
-        let _ = writeln!(
+        write_multiline_start(
             output,
-            "<CommandLineArgument argument=\"{}\" isEnabled=\"{}\"/>",
-            xml_escape(argument),
-            bool_xml(*enabled)
+            indent + 1,
+            "CommandLineArgument",
+            &[
+                ("argument", xml_escape(argument)),
+                ("isEnabled", bool_xml(*enabled).to_owned()),
+            ],
         );
+        write_indent(output, indent + 1);
+        output.push_str("</CommandLineArgument>\n");
     }
     write_indent(output, indent);
     output.push_str("</CommandLineArguments>\n");
 }
 
-fn write_build_for_attributes(output: &mut String, build_types: &[crate::spec::BuildType]) {
-    let all = build_types.is_empty();
-    let has = |kind| all || build_types.contains(&kind);
-    let _ = write!(
-        output,
-        " buildForTesting=\"{}\" buildForRunning=\"{}\" buildForProfiling=\"{}\" buildForArchiving=\"{}\" buildForAnalyzing=\"{}\"",
-        bool_xml(has(crate::spec::BuildType::Testing)),
-        bool_xml(has(crate::spec::BuildType::Running)),
-        bool_xml(has(crate::spec::BuildType::Profiling)),
-        bool_xml(has(crate::spec::BuildType::Archiving)),
-        bool_xml(has(crate::spec::BuildType::Analyzing))
-    );
+fn write_build_action_entry_start(
+    output: &mut String,
+    indent: usize,
+    build_types: &[crate::spec::BuildType],
+) {
+    let mut attrs = Vec::new();
+    for (name, build_type) in [
+        ("buildForTesting", crate::spec::BuildType::Testing),
+        ("buildForRunning", crate::spec::BuildType::Running),
+        ("buildForProfiling", crate::spec::BuildType::Profiling),
+        ("buildForArchiving", crate::spec::BuildType::Archiving),
+        ("buildForAnalyzing", crate::spec::BuildType::Analyzing),
+    ] {
+        attrs.push((name, bool_xml(build_types.contains(&build_type)).to_owned()));
+    }
+    write_multiline_start(output, indent, "BuildActionEntry", &attrs);
 }
 
 fn breakpoints_xml(breakpoints: &[crate::spec::Breakpoint]) -> String {
@@ -5398,6 +6171,26 @@ fn product_type_is_runnable(product_type: &ProductType) -> bool {
             | ProductType::Watch2App
             | ProductType::MessagesApplication
             | ProductType::CommandLineTool
+            | ProductType::AppExtension
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
+            | ProductType::MessagesExtension
+            | ProductType::WatchExtension
+            | ProductType::Watch2Extension
+            | ProductType::TvExtension
+    )
+}
+
+fn scheme_target_is_app_extension(product_type: &ProductType) -> bool {
+    matches!(
+        product_type,
+        ProductType::AppExtension
+            | ProductType::XcodeExtension
+            | ProductType::IntentsServiceExtension
+            | ProductType::MessagesExtension
+            | ProductType::WatchExtension
+            | ProductType::Watch2Extension
+            | ProductType::TvExtension
     )
 }
 
@@ -5442,13 +6235,31 @@ fn scheme_last_upgrade_version(project: &Project) -> String {
         .attributes
         .get("LastUpgradeCheck")
         .and_then(Value::as_str)
-        .unwrap_or("1600")
+        .map(ToOwned::to_owned)
+        .or_else(|| project_xcode_version_last_upgrade_check(project))
+        .as_deref()
+        .unwrap_or("1430")
         .to_owned()
 }
 
 fn write_indent(output: &mut String, indent: usize) {
     for _ in 0..indent {
         output.push_str("   ");
+    }
+}
+
+fn write_multiline_start(
+    output: &mut String,
+    indent: usize,
+    element: &str,
+    attrs: &[(&str, String)],
+) {
+    write_indent(output, indent);
+    let _ = writeln!(output, "<{element}");
+    for (index, (key, value)) in attrs.iter().enumerate() {
+        write_indent(output, indent + 1);
+        let suffix = if index + 1 == attrs.len() { ">" } else { "" };
+        let _ = writeln!(output, "{key} = \"{value}\"{suffix}");
     }
 }
 
@@ -5720,7 +6531,7 @@ fn ordered_config_names(configs: &indexmap::IndexMap<String, String>) -> Vec<Str
         }
     }
     if all_environment_configs && !environments.is_empty() {
-        environments.reverse();
+        environments.sort();
         let mut ordered = Vec::new();
         for environment in &environments {
             for suffix in ["Debug", "Release"] {
@@ -5736,12 +6547,12 @@ fn ordered_config_names(configs: &indexmap::IndexMap<String, String>) -> Vec<Str
 }
 
 fn config_file_reference_key(
-    owner_type: &str,
-    owner_name: &str,
-    config_name: &str,
+    _owner_type: &str,
+    _owner_name: &str,
+    _config_name: &str,
     path: &str,
 ) -> String {
-    format!("configFile:{owner_type}:{owner_name}:{config_name}:{path}")
+    format!("navigatorFileRef:{path}")
 }
 
 fn split_config_file_path(path: &str) -> Option<(String, String)> {
@@ -5860,6 +6671,19 @@ fn insert_project_setting_presets(settings: &mut BTreeMap<String, PbxValue>, con
     }
 }
 
+fn xcconfig_include_path(line: &str) -> Option<PathBuf> {
+    let include = line.strip_prefix("#include")?.trim();
+    let include = include
+        .strip_prefix('"')
+        .and_then(|value| value.split_once('"').map(|(path, _)| path))
+        .or_else(|| {
+            include
+                .strip_prefix('<')
+                .and_then(|value| value.split_once('>').map(|(path, _)| path))
+        })?;
+    Some(PathBuf::from(include))
+}
+
 fn insert_target_setting_presets(
     settings: &mut BTreeMap<String, PbxValue>,
     target: &Target,
@@ -5902,10 +6726,10 @@ fn insert_target_setting_presets(
             settings
                 .entry("TEST_HOST".to_owned())
                 .or_insert_with(|| PbxValue::String(test_host));
-            settings
-                .entry("BUNDLE_LOADER".to_owned())
-                .or_insert_with(|| PbxValue::String("$(TEST_HOST)".to_owned()));
         }
+        settings
+            .entry("BUNDLE_LOADER".to_owned())
+            .or_insert_with(|| PbxValue::String("$(TEST_HOST)".to_owned()));
     } else if target.target_type == ProductType::UiTestBundle {
         settings
             .entry("LD_RUNPATH_SEARCH_PATHS".to_owned())
@@ -6166,11 +6990,32 @@ fn supported_platforms_setting(target: &Target) -> Option<String> {
         return None;
     }
     let mut platforms = Vec::new();
-    for destination in ["iOS", "tvOS", "watchOS", "visionOS", "macOS"] {
-        if !has_supported_destination(target, destination) {
-            continue;
-        }
-        match destination {
+    let has_duplicate_destinations = target
+        .supported_destinations
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != target.supported_destinations.len();
+    let destinations: Vec<String> = if has_duplicate_destinations {
+        ["iOS", "tvOS", "watchOS", "visionOS", "macOS"]
+            .into_iter()
+            .flat_map(|destination| {
+                target
+                    .supported_destinations
+                    .iter()
+                    .filter(move |supported| supported.as_str() == destination)
+                    .map(move |_| destination.to_owned())
+            })
+            .collect()
+    } else {
+        ["iOS", "tvOS", "watchOS", "visionOS", "macOS"]
+            .into_iter()
+            .filter(|destination| has_supported_destination(target, destination))
+            .map(str::to_owned)
+            .collect()
+    };
+    for destination in destinations {
+        match destination.as_str() {
             "iOS" => {
                 platforms.push("iphoneos");
                 platforms.push("iphonesimulator");
@@ -6200,15 +7045,43 @@ fn supported_platforms_setting(target: &Target) -> Option<String> {
 
 fn targeted_device_family_for_destinations(target: &Target) -> Option<String> {
     let mut families = Vec::new();
-    for (destination, family) in [
-        ("iOS", "1"),
-        ("iOS", "2"),
-        ("tvOS", "3"),
-        ("watchOS", "4"),
-        ("visionOS", "7"),
-    ] {
-        if has_supported_destination(target, destination) && !families.contains(&family) {
-            families.push(family);
+    let has_duplicate_destinations = target
+        .supported_destinations
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != target.supported_destinations.len();
+    if has_duplicate_destinations {
+        for destination in ["iOS", "tvOS", "watchOS", "visionOS"] {
+            for supported_destination in &target.supported_destinations {
+                if supported_destination != destination {
+                    continue;
+                }
+                match destination {
+                    "iOS" => {
+                        families.push("1");
+                        families.push("2");
+                    }
+                    "tvOS" => families.push("3"),
+                    "watchOS" => families.push("4"),
+                    "visionOS" => families.push("7"),
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        for (destination, family) in [
+            ("iOS", "1"),
+            ("iOS", "2"),
+            ("tvOS", "3"),
+            ("watchOS", "4"),
+            ("visionOS", "7"),
+        ] {
+            for supported_destination in &target.supported_destinations {
+                if supported_destination == destination && !families.contains(&family) {
+                    families.push(family);
+                }
+            }
         }
     }
     if families.is_empty() {
@@ -6232,6 +7105,17 @@ fn insert_supported_destination_presets(
         "SUPPORTS_MACCATALYST".to_owned(),
         pbx_bool(has_mac_catalyst),
     );
+    if has_macos && !has_ios && !has_tvos && !has_visionos {
+        settings.insert("COMBINE_HIDPI_IMAGES".to_owned(), pbx_bool(true));
+        settings.insert(
+            "SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD".to_owned(),
+            pbx_bool(false),
+        );
+        settings.insert(
+            "TARGETED_DEVICE_FAMILY".to_owned(),
+            PbxValue::String(String::new()),
+        );
+    }
     if has_ios || has_tvos || has_visionos {
         settings.insert(
             "SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD".to_owned(),
@@ -6318,6 +7202,34 @@ fn carthage_framework_search_paths(options: &SpecOptions, target: &Target) -> Op
         values.extend(paths.into_iter().map(PbxValue::String));
         Some(PbxValue::Array(values))
     }
+}
+
+fn framework_dependency_search_paths(target: &Target) -> Option<PbxValue> {
+    let mut paths = BTreeSet::new();
+    for dependency in &target.dependencies {
+        if dependency.dependency_type != DependencyType::Framework {
+            continue;
+        }
+        let parent = Path::new(&dependency.reference)
+            .parent()
+            .and_then(|parent| parent.to_str())
+            .unwrap_or(".");
+        paths.insert(if parent.is_empty() { "." } else { parent }.to_owned());
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    let mut values = vec![PbxValue::String("$(inherited)".to_owned())];
+    values.extend(paths.into_iter().map(|path| {
+        if path == "." {
+            PbxValue::String("\".\"".to_owned())
+        } else if path.contains('/') {
+            PbxValue::String(format!("\"{path}\""))
+        } else {
+            PbxValue::String(path)
+        }
+    }));
+    Some(PbxValue::Array(values))
 }
 
 fn carthage_dependency_references(
@@ -6868,6 +7780,9 @@ fn ordered_group_children(
                 && group_ordering_matches(ordering.pattern.as_deref(), group_name)
         })
         .or_else(|| {
+            if !group_name.is_empty() {
+                return None;
+            }
             options
                 .group_ordering
                 .iter()
@@ -6903,11 +7818,60 @@ fn ordered_group_children(
         ordered_groups.push(child.clone());
         groups.retain(|group| group != &child);
     }
+    let has_packages_group = groups
+        .iter()
+        .any(|group| pbx_value_comment(group) == "Packages");
+    let has_products_group = groups
+        .iter()
+        .any(|group| pbx_value_comment(group) == "Products");
+    let late_names: &[&str] = if group_name.is_empty() && has_packages_group {
+        &["Packages", "Frameworks", "Products"]
+    } else if has_products_group {
+        &["Frameworks"]
+    } else {
+        &[]
+    };
+    let late_main_groups = if !late_names.is_empty() {
+        groups
+            .iter()
+            .filter(|group| late_names.contains(&pbx_value_comment(group).as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    groups.retain(|group| {
+        late_names.is_empty() || !late_names.contains(&pbx_value_comment(group).as_str())
+    });
+    let products = groups
+        .iter()
+        .filter(|group| pbx_value_comment(group) == "Products")
+        .cloned()
+        .collect::<Vec<_>>();
+    groups.retain(|group| pbx_value_comment(group) != "Products");
     ordered_groups.extend(groups);
 
-    match options.group_sort_position {
-        GroupSortPosition::Top => ordered_groups.into_iter().chain(files).collect(),
-        GroupSortPosition::Bottom => files.into_iter().chain(ordered_groups).collect(),
+    match effective_group_sort_position(options) {
+        GroupSortPosition::Top => ordered_groups
+            .into_iter()
+            .chain(files)
+            .chain(late_main_groups)
+            .chain(products)
+            .collect(),
+        GroupSortPosition::Bottom => files
+            .into_iter()
+            .chain(ordered_groups)
+            .chain(late_main_groups)
+            .chain(products)
+            .collect(),
+    }
+}
+
+fn effective_group_sort_position(options: &SpecOptions) -> &GroupSortPosition {
+    if !options.group_sort_position_explicit && options.group_ordering.is_empty() {
+        &GroupSortPosition::Bottom
+    } else {
+        &options.group_sort_position
     }
 }
 
@@ -6948,7 +7912,28 @@ fn pbx_string(value: &PbxValue) -> Option<&str> {
     }
 }
 
-fn should_embed_external_dependency(dependency: &Dependency) -> bool {
+fn project_xcode_version_last_upgrade_check(project: &Project) -> Option<String> {
+    let value = project
+        .options
+        .get("xcodeVersion")
+        .and_then(json_string_value)?;
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    if major > 16 {
+        return None;
+    }
+    Some(format!("{major}{minor:02}"))
+}
+
+fn should_embed_external_dependency(target: &Target, dependency: &Dependency) -> bool {
+    if matches!(
+        target.target_type,
+        ProductType::Framework | ProductType::StaticFramework | ProductType::StaticLibrary
+    ) && dependency.embed != Some(true)
+    {
+        return false;
+    }
     match &dependency.dependency_type {
         DependencyType::Framework => dependency.embed.unwrap_or(true),
         DependencyType::Sdk { .. } => dependency.embed.unwrap_or(false),
@@ -6968,7 +7953,8 @@ fn framework_dependency_reference_key(
     if matches!(dependency.dependency_type, DependencyType::Sdk { .. }) {
         format!("sdkRef:{path}")
     } else {
-        format!("frameworkRef:{target_name}:{}", dependency.reference)
+        let _ = target_name;
+        format!("navigatorFrameworkRef:{path}")
     }
 }
 
@@ -7024,6 +8010,39 @@ fn copy_files_destination_key(settings: &CopyFilesSettings) -> (i64, String, Str
         settings.dst_subfolder_spec,
         settings.dst_path.clone(),
         settings.phase_name.clone(),
+    )
+}
+
+fn copy_files_phase_output_key(
+    dst_subfolder_spec: i64,
+    dst_path: &str,
+    phase_name: &str,
+) -> (i64, i64, String, String) {
+    (
+        copy_files_phase_name_order(phase_name),
+        dst_subfolder_spec,
+        dst_path.to_owned(),
+        phase_name.to_owned(),
+    )
+}
+
+fn copy_files_phase_name_order(phase_name: &str) -> i64 {
+    match phase_name {
+        "Embed Foundation Extensions" => 0,
+        "Embed Frameworks" => 1,
+        _ => 2,
+    }
+}
+
+fn target_xcconfig_preserves_default(key: &str) -> bool {
+    matches!(
+        key,
+        "CURRENT_PROJECT_VERSION"
+            | "DYLIB_COMPATIBILITY_VERSION"
+            | "DYLIB_CURRENT_VERSION"
+            | "DYLIB_INSTALL_NAME_BASE"
+            | "INSTALL_PATH"
+            | "VERSIONING_SYSTEM"
     )
 }
 
@@ -7188,6 +8207,42 @@ fn localized_variant_group_path(base_path: &Path, path: &Path) -> Option<String>
     Some(relative.to_string_lossy().into_owned())
 }
 
+fn localized_variant_group_is_direct_child(source_root: &Path, path: &Path) -> bool {
+    path.parent().and_then(Path::parent) == Some(source_root)
+}
+
+fn localized_variant_group_matches_source(
+    source_root: &Path,
+    source: &TargetSource,
+    path: &Path,
+) -> bool {
+    if is_localized_interface_file(path) {
+        return true;
+    }
+    if path.extension().and_then(|extension| extension.to_str()) == Some("strings") {
+        return source_root.is_dir()
+            && path.starts_with(source_root)
+            && !source
+                .excludes
+                .iter()
+                .any(|pattern| pattern.contains(".lproj/**"));
+    }
+    localized_variant_group_is_direct_child(source_root, path)
+}
+
+fn is_localized_file(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::extension)
+        .and_then(|extension| extension.to_str())
+        == Some("lproj")
+}
+
+fn is_localized_interface_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "storyboard" | "xib"))
+}
+
 fn localized_variant_group_name(path: &Path) -> Option<String> {
     let lproj_dir = path.parent()?;
     if lproj_dir
@@ -7331,6 +8386,18 @@ fn json_bool_value(value: &Value) -> Option<bool> {
         Value::Number(number) => number.as_i64().map(|number| number != 0),
         _ => None,
     }
+}
+
+fn normalize_build_setting_paths(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            path.find("$(")
+                .filter(|index| *index > 0 && path[..*index].ends_with('/'))
+                .map(|index| path[index..].to_owned())
+                .unwrap_or_else(|| path.clone())
+        })
+        .collect()
 }
 
 fn config_matches_variant(
@@ -7847,11 +8914,12 @@ impl PbxValue {
                     let mut values = values.iter().collect::<Vec<_>>();
                     values.sort_by_key(|(key, _)| mapped_id(key, id_map));
                     for (key, value) in values {
+                        let key = mapped_id(key, id_map);
                         let _ = write!(
                             output,
                             "{}{} = ",
                             "\t".repeat(indent + 1),
-                            mapped_id(key, id_map)
+                            quote_pbx_key(&key)
                         );
                         value.write(output, indent + 1, comments, id_map);
                         output.push_str(";\n");
@@ -7969,6 +9037,14 @@ fn quote(value: &str) -> String {
     }
 }
 
+fn quote_pbx_key(value: &str) -> String {
+    if value.len() == 24 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        value.to_owned()
+    } else {
+        quote(value)
+    }
+}
+
 fn expand_source_path(
     base_path: &Path,
     source: &TargetSource,
@@ -8006,7 +9082,6 @@ fn expand_source_path(
     let mut files = Vec::new();
     collect_files(&path, &mut files, file_types);
     files.retain(|file| source_matches_filters(&path, file, source));
-    files.sort();
     files
 }
 
@@ -8138,18 +9213,65 @@ fn source_matches_filters(source_root: &Path, file: &Path, source: &TargetSource
         })
 }
 
+fn source_excludes_directory(source_root: &Path, directory: &Path, source: &TargetSource) -> bool {
+    let relative_to_source = directory
+        .strip_prefix(source_root)
+        .unwrap_or(directory)
+        .to_string_lossy()
+        .into_owned();
+    let relative_to_declared = Path::new(&source.path)
+        .join(&relative_to_source)
+        .to_string_lossy()
+        .into_owned();
+    source.excludes.iter().any(|pattern| {
+        source_pattern_matches(pattern, &relative_to_source)
+            || source_pattern_matches(pattern, &relative_to_declared)
+    })
+}
+
 fn source_pattern_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.trim_end_matches('/');
     let path = path.trim_start_matches("./");
     if pattern.is_empty() {
         return false;
     }
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        return path == suffix
+            || path.starts_with(&format!("{suffix}/"))
+            || path
+                .split('/')
+                .scan(String::new(), |prefix, part| {
+                    if prefix.is_empty() {
+                        prefix.push_str(part);
+                    } else {
+                        prefix.push('/');
+                        prefix.push_str(part);
+                    }
+                    Some(path.strip_prefix(&format!("{prefix}/")).unwrap_or(""))
+                })
+                .any(|tail| !tail.is_empty() && source_pattern_matches(suffix, tail))
+            || wildcard_match(suffix, path)
+            || path.split('/').any(|part| wildcard_match(suffix, part));
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        if prefix.contains('*') {
+            return path
+                .split('/')
+                .scan(String::new(), |ancestor, part| {
+                    if ancestor.is_empty() {
+                        ancestor.push_str(part);
+                    } else {
+                        ancestor.push('/');
+                        ancestor.push_str(part);
+                    }
+                    Some(ancestor.clone())
+                })
+                .any(|ancestor| wildcard_match(prefix, &ancestor));
+        }
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
     if path == pattern || path.starts_with(&format!("{pattern}/")) {
         return true;
-    }
-    if let Some(suffix) = pattern.strip_prefix("**/") {
-        return wildcard_match(suffix, path)
-            || path.split('/').any(|part| wildcard_match(suffix, part));
     }
     wildcard_match(pattern, path)
         || Path::new(path)
@@ -8222,7 +9344,7 @@ fn collect_files(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if name.starts_with('.')
+        if (name.starts_with('.') && name != ".swiftlint.yml")
             || name == "Carthage"
             || name.ends_with(".xcodeproj")
             || path.extension().and_then(|extension| extension.to_str()) == Some("orig")
@@ -8244,7 +9366,12 @@ fn collect_files(
     }
 }
 
-fn collect_known_regions(path: &Path, regions: &mut BTreeSet<String>) {
+fn collect_known_regions_for_source(
+    source_root: &Path,
+    path: &Path,
+    source: &TargetSource,
+    regions: &mut BTreeSet<String>,
+) {
     if path.is_file() {
         return;
     }
@@ -8253,14 +9380,17 @@ fn collect_known_regions(path: &Path, regions: &mut BTreeSet<String>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            if path.extension().and_then(|extension| extension.to_str()) == Some("lproj") {
-                if let Some(region) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    regions.insert(region.to_owned());
-                }
-            }
-            collect_known_regions(&path, regions);
+        if !path.is_dir() {
+            continue;
         }
+        if path.extension().and_then(|extension| extension.to_str()) == Some("lproj")
+            && source_matches_filters(source_root, &path, source)
+        {
+            if let Some(region) = path.file_stem().and_then(|stem| stem.to_str()) {
+                regions.insert(region.to_owned());
+            }
+        }
+        collect_known_regions_for_source(source_root, &path, source, regions);
     }
 }
 
@@ -8334,8 +9464,8 @@ fn natural_cmp(left: &str, right: &str) -> std::cmp::Ordering {
             continue;
         }
 
-        let left_byte = left[left_index].to_ascii_lowercase();
-        let right_byte = right[right_index].to_ascii_lowercase();
+        let left_byte = left[left_index];
+        let right_byte = right[right_index];
         match left_byte.cmp(&right_byte) {
             std::cmp::Ordering::Equal => {
                 left_index += 1;
@@ -8346,6 +9476,66 @@ fn natural_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     }
 
     left.len().cmp(&right.len())
+}
+
+fn natural_group_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut left_index = 0;
+    let mut right_index = 0;
+
+    while left_index < left.len() && right_index < right.len() {
+        let left_is_digit = left[left_index].is_ascii_digit();
+        let right_is_digit = right[right_index].is_ascii_digit();
+
+        if left_is_digit && right_is_digit {
+            let left_start = left_index;
+            let right_start = right_index;
+            while left_index < left.len() && left[left_index].is_ascii_digit() {
+                left_index += 1;
+            }
+            while right_index < right.len() && right[right_index].is_ascii_digit() {
+                right_index += 1;
+            }
+            let left_number = std::str::from_utf8(&left[left_start..left_index])
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let right_number = std::str::from_utf8(&right[right_start..right_index])
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            match left_number.cmp(&right_number) {
+                std::cmp::Ordering::Equal => {}
+                ordering => return ordering,
+            }
+            continue;
+        }
+
+        let left_byte = natural_sort_byte(left[left_index].to_ascii_lowercase());
+        let right_byte = natural_sort_byte(right[right_index].to_ascii_lowercase());
+        match left_byte.cmp(&right_byte) {
+            std::cmp::Ordering::Equal => {
+                left_index += 1;
+                right_index += 1;
+            }
+            ordering => return ordering,
+        }
+    }
+
+    left.len().cmp(&right.len())
+}
+
+fn natural_sort_byte(byte: u8) -> u8 {
+    if byte == b'_' {
+        0
+    } else if byte == b'-' {
+        b')'
+    } else if byte == b'.' {
+        b'*'
+    } else {
+        byte
+    }
 }
 
 fn build_phase_for_source(path: &str) -> Option<&'static str> {
@@ -8518,12 +9708,26 @@ fn file_type_for_path(path: &str, product_type: Option<&ProductType>) -> String 
         .and_then(|extension| extension.to_str())
     {
         Some("swift") => "sourcecode.swift",
+        Some("d") => "sourcecode.dtrace",
         Some("m") => "sourcecode.c.objc",
         Some("mm") => "sourcecode.cpp.objcpp",
         Some("cpp") | Some("cc") | Some("cxx") | Some("cp") => "sourcecode.cpp.cpp",
         Some("h") | Some("hh") | Some("hpp") | Some("ipp") | Some("tpp") | Some("hxx")
         | Some("def") => "sourcecode.c.h",
         Some("plist") => "text.plist",
+        Some("txt") => "text",
+        Some("yml") | Some("yaml") => "text.yaml",
+        Some("md") | Some("markdown") => "net.daringfireball.markdown",
+        Some("json") => "text.json",
+        Some("html") => "text.html",
+        Some("sh") => "text.script.sh",
+        Some("png") => "image.png",
+        Some("gif") => "image.gif",
+        Some("jpg") | Some("jpeg") => "image.jpeg",
+        Some("mp3") => "audio.mp3",
+        Some("dae") => "text.xml.dae",
+        Some("js") => "sourcecode.javascript",
+        Some("metal") => "sourcecode.metal",
         Some("strings") => "text.plist.strings",
         Some("stringsdict") => "text.plist.stringsdict",
         Some("entitlements") => "text.plist.entitlements",
@@ -8545,8 +9749,11 @@ fn file_type_for_path(path: &str, product_type: Option<&ProductType>) -> String 
         Some("storyboard") => "file.storyboard",
         Some("xib") => "file.xib",
         Some("framework") => "wrapper.framework",
+        Some("xcframework") => "wrapper.xcframework",
         Some("xpc") => "wrapper.xpc-service",
         Some("a") => "archive.ar",
+        Some("bin") => "archive.macbinary",
+        Some("zip") => "archive.zip",
         Some("dylib") => "compiled.mach-o.dylib",
         Some("tbd") => "sourcecode.text-based-dylib-definition",
         Some("bundle") => "wrapper.cfbundle",
@@ -8607,6 +9814,17 @@ fn package_url(package: &serde_json::Value) -> Option<String> {
         })
 }
 
+fn package_reference_comment(package_name: &str, url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    trimmed
+        .rsplit('/')
+        .next()
+        .and_then(|component| component.strip_suffix(".git").or(Some(component)))
+        .filter(|component| !component.is_empty())
+        .unwrap_or(package_name)
+        .to_owned()
+}
+
 fn package_requirement(package: &serde_json::Value) -> BTreeMap<String, PbxValue> {
     let mut requirement = BTreeMap::new();
     if let Some(version) = package.get("exactVersion").and_then(json_string_value) {
@@ -8621,7 +9839,11 @@ fn package_requirement(package: &serde_json::Value) -> BTreeMap<String, PbxValue
             PbxValue::String("exactVersion".to_owned()),
         );
         requirement.insert("version".to_owned(), PbxValue::String(version));
-    } else if let Some(version) = package.get("majorVersion").and_then(json_string_value) {
+    } else if let Some(version) = package
+        .get("majorVersion")
+        .or_else(|| package.get("from"))
+        .and_then(json_string_value)
+    {
         requirement.insert(
             "kind".to_owned(),
             PbxValue::String("upToNextMajorVersion".to_owned()),

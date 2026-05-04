@@ -2010,6 +2010,33 @@ fn writer_generates_entitlements_and_build_setting_like_xcodegen() {
 }
 
 #[test]
+fn writer_executes_post_gen_command_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "PostGen",
+            "options": {
+                "postGenCommand": "mkdir -p PostGen.xcodeproj/xcshareddata && printf copied > PostGen.xcodeproj/xcshareddata/generated.txt"
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS"
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::write(&project, None).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(generated.project_path.join("xcshareddata/generated.txt")).unwrap(),
+        "copied"
+    );
+}
+
+#[test]
 fn generator_omits_configured_info_plist_from_resources_like_xcodegen() {
     let temp = tempfile::TempDir::new().unwrap();
     fs::create_dir(temp.path().join("Sources")).unwrap();
@@ -2590,13 +2617,13 @@ fn generator_sorts_source_groups_and_files_like_xcodegen() {
     assert_names_in_order(
         group_children_block_with_path(&generated, "Sources"),
         &[
-            "group",
-            "group2",
             "1file.a",
             "10file.a",
             "file.swift",
             "file2.swift",
             "file3.swift",
+            "group",
+            "group2",
         ],
     );
 }

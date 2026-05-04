@@ -121,6 +121,17 @@ cargo audit --deny warnings
 
 Local benchmark artifacts should stay under `.context/bench`, which is ignored by git.
 
+For public real-world XcodeGen comparisons, use:
+
+```sh
+scripts/bench_public_xcodegen.sh --only mapbox-maps-ios
+```
+
+The script keeps cloned repositories, generated projects, diffs, and timing JSON under
+`.context/bench/public-xcodegen`. It compares upstream XcodeGen output against `xgr`
+byte-for-byte for `project.pbxproj` and the full generated `.xcodeproj`, then runs
+timing benchmarks with `hyperfine` when it is installed.
+
 See `CONTRIBUTING.md` for the full contribution workflow, upstream fixture maintenance process, and issue-reporting expectations.
 
 See `CHANGELOG.md` for release history and unreleased public-prep changes.
