@@ -2139,6 +2139,72 @@ fn writer_executes_post_gen_command_like_xcodegen() {
 }
 
 #[test]
+fn writer_executes_pre_gen_command_before_generation_like_xcodegen() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "PreGen",
+            "options": {
+                "preGenCommand": "mkdir -p Sources && printf 'import Foundation\n' > Sources/Generated.swift"
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS",
+                    "sources": ["Sources"]
+                }
+            }
+        }),
+    );
+
+    let generated = ProjectWriter::write(&project, None).unwrap();
+
+    assert!(temp.path().join("Sources/Generated.swift").exists());
+    assert!(generated.pbxproj.contains("Generated.swift in Sources"));
+}
+
+#[test]
+fn writer_runs_project_commands_in_project_base_directory() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let output_dir = temp.path().join("Out");
+    fs::create_dir(&output_dir).unwrap();
+    let project = project_from_json(
+        temp.path().to_path_buf(),
+        serde_json::json!({
+            "name": "CommandDirectory",
+            "options": {
+                "preGenCommand": "printf pre > pre.txt",
+                "postGenCommand": "printf post > post.txt"
+            },
+            "targets": {
+                "App": {
+                    "type": "application",
+                    "platform": "iOS"
+                }
+            }
+        }),
+    );
+
+    ProjectWriter::write(
+        &project,
+        Some(&output_dir.join("CommandDirectory.xcodeproj")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("pre.txt")).unwrap(),
+        "pre"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("post.txt")).unwrap(),
+        "post"
+    );
+    assert!(!output_dir.join("pre.txt").exists());
+    assert!(!output_dir.join("post.txt").exists());
+}
+
+#[test]
 fn generator_omits_configured_info_plist_from_resources_like_xcodegen() {
     let temp = tempfile::TempDir::new().unwrap();
     fs::create_dir(temp.path().join("Sources")).unwrap();

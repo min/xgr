@@ -22,7 +22,8 @@ Implemented:
 - Typed models for projects, targets, dependencies, sources, settings, schemes, plists, and breakpoints.
 - Deterministic PBX project generation.
 - Scheme, breakpoint, generated plist, and entitlement file writing.
-- XcodeGen `postGenCommand` execution when writing a project.
+- XcodeGen `preGenCommand` and `postGenCommand` execution when writing a
+  project.
 - Upstream XcodeGen fixture coverage and test-inventory tracking.
 - GitHub Actions CI for formatting, clippy, tests, and dependency audit.
 
@@ -34,10 +35,9 @@ The compatibility target is upstream XcodeGen behavior for `project.yml` specs. 
 
 Known limitations:
 
-- XcodeGen `preGenCommand` hooks are not executed.
-- `postGenCommand` is executed by project-writing paths (`xgr generate` and
-  `ProjectWriter::write`), but not by in-memory generation
-  (`ProjectWriter::generate`).
+- XcodeGen `preGenCommand` and `postGenCommand` hooks are executed by
+  project-writing paths (`xgr generate` and `ProjectWriter::write`), but not by
+  in-memory generation (`ProjectWriter::generate`).
 - Compatibility is measured against the vendored `upstream-xcodegen` checkout. Updating that checkout requires rerunning the inventory workflow documented in `TEST_PARITY.md`.
 - The project is not yet released as a supported replacement for every real-world XcodeGen configuration. If output differs from upstream XcodeGen, please file a compatibility issue with the spec and a description of the expected output.
 
@@ -143,8 +143,8 @@ See `CHANGELOG.md` for release history and unreleased public-prep changes.
 
 Treat project specs as trusted project configuration, not sandboxed input. `xgr` reads files referenced by specs and writes generated project artifacts to requested output paths.
 
-`xgr` does not currently execute XcodeGen `preGenCommand` hooks. `postGenCommand`
-is executed when writing a project, and generated Xcode projects may still
-contain build scripts that Xcode can execute later.
+`preGenCommand` and `postGenCommand` are executed when writing a project, and
+generated Xcode projects may still contain build scripts that Xcode can execute
+later.
 
 See `SECURITY.md` for vulnerability reporting guidance.

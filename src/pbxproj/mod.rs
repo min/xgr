@@ -136,6 +136,10 @@ impl ProjectWriter {
         project: &Project,
         output: Option<&Path>,
     ) -> Result<GeneratedProject, ProjectWriteError> {
+        run_project_command(
+            &project.base_path,
+            project.spec_options.pre_gen_command.as_deref(),
+        )?;
         let mut generated = Self::generate(project)?;
         if let Some(output) = output {
             generated.project_path = output.to_path_buf();
@@ -170,22 +174,25 @@ impl ProjectWriter {
         write_schemes(project, &generated.project_path, &generated.object_id_map)?;
         write_scheme_management(project, &generated.project_path)?;
         write_breakpoints(project, &generated.project_path)?;
-        run_project_command(project, project.spec_options.post_gen_command.as_deref())?;
+        run_project_command(
+            &project.base_path,
+            project.spec_options.post_gen_command.as_deref(),
+        )?;
         Ok(generated)
     }
 }
 
-fn run_project_command(project: &Project, command: Option<&str>) -> Result<(), ProjectWriteError> {
+fn run_project_command(directory: &Path, command: Option<&str>) -> Result<(), ProjectWriteError> {
     let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
         return Ok(());
     };
     let output = Command::new("/bin/sh")
         .arg("-c")
         .arg(command)
-        .current_dir(&project.base_path)
+        .current_dir(directory)
         .output()
         .map_err(|source| ProjectWriteError::Write {
-            path: project.base_path.clone(),
+            path: directory.to_path_buf(),
             source,
         })?;
     if output.status.success() {
