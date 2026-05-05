@@ -69,11 +69,12 @@ See [`BENCHMARKS.md`](BENCHMARKS.md) for the public real-world comparison harnes
 
 ## Install
 
-### Homebrew HEAD
+### Homebrew
 
 ```sh
 brew tap min/xgr https://github.com/min/xgr
-brew install --HEAD xgr
+brew install xgr            # stable: latest tagged release
+brew install --HEAD xgr     # bleeding edge: builds from main
 ```
 
 ### From source
@@ -90,7 +91,7 @@ If you cloned without submodules:
 git submodule update --init --recursive
 ```
 
-Published crates.io packages, stable Homebrew tarballs, and binary release artifacts are not available yet. Source builds and the Homebrew HEAD formula are the supported installation paths until then.
+Published crates.io packages and prebuilt binary release artifacts are not available yet. Homebrew (stable or HEAD) and source builds are the supported installation paths until then.
 
 ## Usage
 
