@@ -69,6 +69,12 @@ See [`BENCHMARKS.md`](BENCHMARKS.md) for the public real-world comparison harnes
 
 ## Install
 
+### crates.io
+
+```sh
+cargo install xgr --locked
+```
+
 ### Homebrew
 
 ```sh
@@ -91,7 +97,7 @@ If you cloned without submodules:
 git submodule update --init --recursive
 ```
 
-Published crates.io packages and prebuilt binary release artifacts are not available yet. Homebrew (stable or HEAD) and source builds are the supported installation paths until then.
+Prebuilt binary release artifacts are not yet attached to GitHub releases.
 
 ## Usage
 
