@@ -6,8 +6,18 @@ This project is pre-1.0. Until a stable compatibility policy is published, minor
 
 ## Unreleased
 
+## 0.1.0 — 2026-05-05
+
+Initial public release.
+
 ### Added
 
+- Initial Rust implementation of XcodeGen-compatible spec loading and project generation.
+- `xgr` CLI with `validate`, `dump`, and `generate` commands.
+- YAML and JSON spec loading with include resolution, variable expansion, target templates, schemes, settings, plists, and breakpoints.
+- Deterministic PBX project generation and generated artifact writing.
+- Upstream XcodeGen fixture coverage and test-inventory tracking.
+- GitHub Actions CI for clippy, tests, and dependency audit.
 - Public README guidance for status, compatibility, source installation, and security expectations.
 - Contributor workflow covering required checks and upstream XcodeGen parity maintenance.
 - GitHub issue templates for bugs, compatibility gaps, and feature requests.
@@ -61,14 +71,3 @@ This project is pre-1.0. Until a stable compatibility policy is published, minor
   clone per spec node during resolution.
 - `expand_variables_in_map` skips the `mem::take` rebuild when no map key
   contains a `${variable}` reference, walking values in place instead.
-
-## 0.1.0
-
-### Added
-
-- Initial Rust implementation of XcodeGen-compatible spec loading and project generation.
-- `xgr` CLI with `validate`, `dump`, and `generate` commands.
-- YAML and JSON spec loading with include resolution, variable expansion, target templates, schemes, settings, plists, and breakpoints.
-- Deterministic PBX project generation and generated artifact writing.
-- Upstream XcodeGen fixture coverage and test-inventory tracking.
-- GitHub Actions CI for clippy, tests, and dependency audit.
